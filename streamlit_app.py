@@ -2,11 +2,18 @@ import hashlib
 import io
 import json
 import re
+from copy import copy
+from datetime import date, datetime
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import pdfplumber
 import streamlit as st
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
+from openpyxl.utils.cell import get_column_letter, range_boundaries
+from openpyxl.worksheet.table import Table
 
 
 st.set_page_config(
@@ -16,7 +23,7 @@ st.set_page_config(
 )
 
 REQUIRED_TRADES = ("AC", "EL", "FS", "PD")
-APP_VERSION = "0.4.2 — Location sorting"
+APP_VERSION = "0.5.2 — Safe Excel update"
 PARSER_MODE_OPTIONS = {
     "自動偵測": "auto",
     "Location＋Manpower數字欄": "numeric_table",
@@ -660,7 +667,34 @@ def build_location_result(
     )
 
     if is_cross_floor:
-        readable_floors = " + ".join(floors)
+        # Preserve compact source ranges. Example: the EL report location
+        # "B4-3" means a grouped B4-to-3F record; it must not collapse to B4.
+        basement_to_floor = re.fullmatch(
+            r"B(\d+)-(\d+)F?",
+            canonical_location,
+            re.I,
+        )
+        basement_range = re.fullmatch(
+            r"B(\d+)-B(\d+)",
+            canonical_location,
+            re.I,
+        )
+
+        if basement_to_floor:
+            readable_floors = (
+                f"B{int(basement_to_floor.group(1))}-"
+                f"{int(basement_to_floor.group(2))}F"
+            )
+        elif basement_range:
+            readable_floors = (
+                f"B{int(basement_range.group(1))}-"
+                f"B{int(basement_range.group(2))}"
+            )
+        else:
+            readable_floors = " + ".join(floors)
+
+        floor_text = readable_floors
+
         if len(towers) == 1:
             review_location = (
                 f"Cross-floor / {towers[0]} / {readable_floors}"
@@ -677,7 +711,7 @@ def build_location_result(
             review_location,
             tower_text,
             floor_text,
-            "跨樓層／多位置，保留於人工確認區",
+            "跨樓層／多位置，人數分布未指定",
         )
 
     floor = floors[0]
@@ -1518,6 +1552,1397 @@ def analyse_report_pdf(
     )
 
 
+
+
+# =========================================================
+# Excel template export functions
+# =========================================================
+
+
+EXCEL_REQUIRED_SHEETS = (
+    "Overview",
+    "Data Rules",
+    "Daily Master",
+    "Location Detail",
+    "Cross-F & distribution U",
+    "Department Summary",
+)
+
+TRADE_COLUMN_MAP = {
+    "AC": 4,
+    "EL": 5,
+    "FS": 6,
+    "PD": 7,
+}
+
+DAILY_TRADE_COLUMN_MAP = {
+    "AC": 2,
+    "EL": 3,
+    "FS": 4,
+    "PD": 5,
+}
+
+
+def parse_date_value(value: Any) -> date | None:
+    """Convert report, pandas or Excel date values into a Python date."""
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        return value.date()
+
+    if isinstance(value, date):
+        return value
+
+    text = clean_cell(value)
+    if not text or text in {"未讀取", "分析失敗"}:
+        return None
+
+    parsed = pd.to_datetime(text, errors="coerce", dayfirst=False)
+    if pd.isna(parsed):
+        parsed = pd.to_datetime(text, errors="coerce", dayfirst=True)
+
+    if pd.isna(parsed):
+        return None
+
+    return parsed.date()
+
+
+def to_non_negative_int(value: Any) -> int | None:
+    """Convert a cell-like value into a non-negative integer."""
+    if value is None or value == "":
+        return None
+
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if pd.isna(numeric) or numeric < 0:
+        return None
+
+    return int(round(numeric))
+
+
+def build_daily_updates(
+    summary_rows: list[dict[str, Any]],
+) -> tuple[
+    dict[date, dict[str, int]],
+    dict[date, set[str]],
+    list[str],
+]:
+    """Prepare Daily Master values and the date/trade update scope."""
+    updates: dict[date, dict[str, int]] = {}
+    update_scope: dict[date, set[str]] = {}
+    seen_keys: set[tuple[date, str]] = set()
+    duplicate_keys: list[str] = []
+
+    for summary in summary_rows:
+        report_date = parse_date_value(summary.get("日期"))
+        trade = clean_cell(summary.get("工種")).upper()
+
+        if report_date is None or trade not in REQUIRED_TRADES:
+            continue
+
+        update_scope.setdefault(report_date, set()).add(trade)
+
+        # The user's workbook Data Rules define Daily Master as
+        # Today Total Manpower, not Worker.
+        daily_total = to_non_negative_int(
+            summary.get("Today Total Manpower")
+        )
+
+        if daily_total is None:
+            daily_total = to_non_negative_int(summary.get("Worker"))
+
+        if daily_total is None:
+            daily_total = to_non_negative_int(
+                summary.get("工作明細人數合計")
+            )
+
+        if daily_total is None:
+            continue
+
+        key = (report_date, trade)
+        if key in seen_keys:
+            duplicate_keys.append(
+                f"{report_date.isoformat()} {trade}"
+            )
+
+        seen_keys.add(key)
+        updates.setdefault(report_date, {})[trade] = daily_total
+
+    return updates, update_scope, sorted(set(duplicate_keys))
+
+
+def standard_location_to_workbook(
+    standard_location: str,
+) -> tuple[str, str, str, bool]:
+    """Convert an app location into the workbook fields and note."""
+    location = clean_cell(standard_location)
+
+    tower_exact = re.fullmatch(
+        r"T\s*(\d+)\s*/\s*(\d+F)",
+        location,
+        re.I,
+    )
+    if tower_exact:
+        tower_number = int(tower_exact.group(1))
+        floor = tower_exact.group(2).upper()
+        return (
+            f"Tower {tower_number}",
+            f"T{tower_number} {floor}",
+            "Exact/specific work location recorded in the daily report.",
+            False,
+        )
+
+    podium_exact = re.fullmatch(
+        r"Podium\s*/\s*(GF|\d+F)",
+        location,
+        re.I,
+    )
+    if podium_exact:
+        return (
+            "Podium",
+            podium_exact.group(1).upper(),
+            "Exact/specific work location recorded in the daily report.",
+            False,
+        )
+
+    basement_exact = re.fullmatch(
+        r"Basement\s*/\s*(B\d+)",
+        location,
+        re.I,
+    )
+    if basement_exact:
+        return (
+            "Basement",
+            basement_exact.group(1).upper(),
+            "Exact/specific work location recorded in the daily report.",
+            False,
+        )
+
+    tower_floor_unspecified = re.fullmatch(
+        r"T\s*(\d+)\s*/\s*Floor\s*U",
+        location,
+        re.I,
+    )
+    if tower_floor_unspecified:
+        tower_number = int(tower_floor_unspecified.group(1))
+        return (
+            f"Tower {tower_number}",
+            f"T{tower_number} (floor unspecified)",
+            "Tower stated, but the exact floor was not stated in the daily report.",
+            True,
+        )
+
+    if re.fullmatch(r"Podium\s*/\s*Floor\s*U", location, re.I):
+        return (
+            "Podium",
+            "Podium (floor unspecified)",
+            "Podium stated, but the exact floor was not stated in the daily report.",
+            True,
+        )
+
+    if re.fullmatch(r"Basement\s*/\s*Floor\s*U", location, re.I):
+        return (
+            "Basement",
+            "Basement (floor unspecified)",
+            "Basement stated, but the exact floor was not stated in the daily report.",
+            True,
+        )
+
+    unspecified_tower_floor = re.fullmatch(
+        r"Unspecified Tower\s*/\s*(GF|\d+F)",
+        location,
+        re.I,
+    )
+    if unspecified_tower_floor:
+        return (
+            "Tower (unspecified)",
+            unspecified_tower_floor.group(1).upper(),
+            "Floor stated, but the exact tower was not stated in the daily report.",
+            True,
+        )
+
+    if re.fullmatch(
+        r"Unspecified Tower\s*/\s*Floor\s*U",
+        location,
+        re.I,
+    ):
+        return (
+            "Tower",
+            "Tower (tower/floor unspecified)",
+            "Tower area stated, but the exact tower and floor were not stated in the daily report.",
+            True,
+        )
+
+    special_location = re.fullmatch(
+        r"(Roof|M/F|UG/F|Clubhouse)",
+        location,
+        re.I,
+    )
+    if special_location:
+        special = special_location.group(1)
+        return (
+            "Special",
+            special,
+            "Exact/specific work location recorded in the daily report.",
+            False,
+        )
+
+    return (
+        "Other",
+        location or "Location unspecified",
+        "The exact work location was not stated in the daily report.",
+        True,
+    )
+
+def is_single_area_uncertain_location(
+    standard_location: str,
+) -> bool:
+    """Return True when an uncertain item still belongs in Location Detail."""
+    location = clean_cell(standard_location)
+
+    patterns = (
+        r"T\s*\d+\s*/\s*Floor\s*U",
+        r"Podium\s*/\s*Floor\s*U",
+        r"Basement\s*/\s*Floor\s*U",
+        r"Unspecified Tower\s*/\s*(?:GF|\d+F)",
+        r"Unspecified Tower\s*/\s*Floor\s*U",
+    )
+
+    return any(
+        re.fullmatch(pattern, location, re.I)
+        for pattern in patterns
+    )
+
+
+def format_cross_floor_location(
+    standard_location: str,
+) -> tuple[str, str, bool, str]:
+    """Create Cross-F workbook text. All such rows are uncertain."""
+    location = clean_cell(standard_location)
+    area = "Cross-floor / Multi-location"
+
+    if not location or location.lower() == "unspecified":
+        return (
+            area,
+            "Location not stated (distribution unspecified)",
+            True,
+            "No work location was stated in the daily report; worker distribution is unspecified.",
+        )
+
+    tower_cross = re.fullmatch(
+        r"Cross-floor\s*/\s*T\s*(\d+)\s*/\s*(.+)",
+        location,
+        re.I,
+    )
+    if tower_cross:
+        tower = f"T{int(tower_cross.group(1))}"
+        floor_text = clean_cell(tower_cross.group(2))
+
+        # Keep compact ranges such as B4-3F intact; otherwise prefix the
+        # tower to each listed floor.
+        if re.fullmatch(r"B\d+-\d+F", floor_text, re.I):
+            formatted = floor_text.upper()
+        else:
+            floors = [
+                clean_cell(item).upper()
+                for item in floor_text.split("+")
+                if clean_cell(item)
+            ]
+            formatted = " + ".join(
+                f"{tower} {floor}"
+                for floor in floors
+            )
+
+        if not formatted.lower().endswith(
+            "(distribution unspecified)"
+        ):
+            formatted += " (distribution unspecified)"
+
+        return (
+            area,
+            formatted,
+            True,
+            "Multiple floors/locations were stated, but worker distribution between them was not specified.",
+        )
+
+    general_cross = re.fullmatch(
+        r"Cross-floor\s*/\s*(.+)",
+        location,
+        re.I,
+    )
+    if general_cross:
+        formatted = clean_cell(general_cross.group(1))
+        if not formatted.lower().endswith(
+            "(distribution unspecified)"
+        ):
+            formatted += " (distribution unspecified)"
+
+        return (
+            area,
+            formatted,
+            True,
+            "Multiple floors/locations were stated, but worker distribution between them was not specified.",
+        )
+
+    distribution = re.fullmatch(
+        r"Distribution U\s*/\s*(.+)",
+        location,
+        re.I,
+    )
+    if distribution:
+        formatted = clean_cell(distribution.group(1))
+        if not formatted.lower().endswith(
+            "(distribution unspecified)"
+        ):
+            formatted += " (distribution unspecified)"
+
+        return (
+            area,
+            formatted,
+            True,
+            "Multiple areas/towers were stated, but worker distribution between them was not specified.",
+        )
+
+    formatted = location
+    if not formatted.lower().endswith(
+        "(distribution unspecified)"
+    ):
+        formatted += " (distribution unspecified)"
+
+    return (
+        area,
+        formatted,
+        True,
+        "The exact worker distribution was not stated in the daily report.",
+    )
+
+def workbook_record_sort_key(
+    record: dict[str, Any],
+) -> tuple[Any, ...]:
+    """Sort only the updated date block in practical site order."""
+    report_date = record["date"]
+    area = clean_cell(record["area"])
+    location = clean_cell(record["location"])
+
+    tower_area = re.fullmatch(r"Tower\s+(\d+)", area, re.I)
+    tower_exact = re.fullmatch(
+        r"T\s*(\d+)\s+(\d+)F",
+        location,
+        re.I,
+    )
+    if tower_area and tower_exact:
+        tower_number = int(tower_area.group(1))
+        floor_number = int(tower_exact.group(2))
+        return (report_date, 0, tower_number, -floor_number, location)
+
+    tower_unspecified = re.fullmatch(
+        r"T\s*(\d+)\s*\(floor unspecified\)",
+        location,
+        re.I,
+    )
+    if tower_area and tower_unspecified:
+        tower_number = int(tower_area.group(1))
+        return (report_date, 0, tower_number, 9999, location)
+
+    if area.lower() == "tower" and re.fullmatch(
+        r"Tower\s*\(tower/floor unspecified\)",
+        location,
+        re.I,
+    ):
+        return (report_date, 0, 999, 9999, location)
+
+    if area.lower() == "podium":
+        podium_floor = re.fullmatch(r"(GF|\d+F)", location, re.I)
+        if podium_floor:
+            floor = podium_floor.group(1).upper()
+            floor_rank = 0 if floor == "GF" else -int(
+                re.search(r"\d+", floor).group()
+            )
+            return (report_date, 1, 0, floor_rank, location)
+
+        if "floor unspecified" in location.lower():
+            return (report_date, 1, 0, 9999, location)
+
+    if area.lower() == "basement":
+        basement_floor = re.fullmatch(r"B(\d+)", location, re.I)
+        if basement_floor:
+            return (
+                report_date,
+                2,
+                0,
+                int(basement_floor.group(1)),
+                location,
+            )
+
+        if "floor unspecified" in location.lower():
+            return (report_date, 2, 0, 9999, location)
+
+    return (report_date, 3, 0, 0, f"{area} {location}")
+
+def read_location_records(
+    worksheet: Any,
+) -> list[dict[str, Any]]:
+    """Read populated records from Location Detail or Cross-F."""
+    records: list[dict[str, Any]] = []
+
+    for row_number in range(2, worksheet.max_row + 1):
+        report_date = parse_date_value(
+            worksheet.cell(row_number, 1).value
+        )
+        area = clean_cell(
+            worksheet.cell(row_number, 2).value
+        )
+        location = clean_cell(
+            worksheet.cell(row_number, 3).value
+        )
+
+        if report_date is None or not area or not location:
+            continue
+
+        values = {
+            trade: (
+                to_non_negative_int(
+                    worksheet.cell(
+                        row_number,
+                        TRADE_COLUMN_MAP[trade],
+                    ).value
+                )
+                or 0
+            )
+            for trade in REQUIRED_TRADES
+        }
+
+        records.append(
+            {
+                "date": report_date,
+                "area": area,
+                "location": location,
+                **values,
+                "note": clean_cell(
+                    worksheet.cell(row_number, 9).value
+                ),
+                "uncertain": (
+                    "unspecified"
+                    in clean_cell(
+                        worksheet.cell(row_number, 9).value
+                    ).lower()
+                ),
+            }
+        )
+
+    return records
+
+
+def merge_location_updates(
+    existing_records: list[dict[str, Any]],
+    new_records: list[dict[str, Any]],
+    update_scope: dict[date, set[str]],
+) -> list[dict[str, Any]]:
+    """Replace only the analysed date/trade values, preserving other trades."""
+    record_map: dict[
+        tuple[date, str, str],
+        dict[str, Any],
+    ] = {}
+
+    for record in existing_records:
+        copied_record = dict(record)
+
+        for trade in update_scope.get(
+            copied_record["date"],
+            set(),
+        ):
+            copied_record[trade] = 0
+
+        key = (
+            copied_record["date"],
+            copied_record["area"],
+            copied_record["location"],
+        )
+        record_map[key] = copied_record
+
+    for new_record in new_records:
+        key = (
+            new_record["date"],
+            new_record["area"],
+            new_record["location"],
+        )
+
+        target = record_map.setdefault(
+            key,
+            {
+                "date": new_record["date"],
+                "area": new_record["area"],
+                "location": new_record["location"],
+                "AC": 0,
+                "EL": 0,
+                "FS": 0,
+                "PD": 0,
+                "note": new_record["note"],
+                "uncertain": new_record["uncertain"],
+            },
+        )
+
+        for trade in update_scope.get(
+            new_record["date"],
+            set(),
+        ):
+            if trade in new_record:
+                target[trade] = (
+                    to_non_negative_int(
+                        new_record.get(trade)
+                    )
+                    or 0
+                )
+
+        target["note"] = new_record["note"]
+        target["uncertain"] = new_record["uncertain"]
+
+    return [
+        record
+        for record in record_map.values()
+        if sum(
+            int(record.get(trade, 0) or 0)
+            for trade in REQUIRED_TRADES
+        )
+        > 0
+    ]
+
+
+def find_sample_row(
+    worksheet: Any,
+    *,
+    exact: bool,
+    fallback: int = 2,
+) -> int:
+    """Find an existing exact or yellow uncertain row for style copying."""
+    for row_number in range(2, worksheet.max_row + 1):
+        note = clean_cell(
+            worksheet.cell(row_number, 9).value
+        ).lower()
+
+        if not note:
+            continue
+
+        is_uncertain = (
+            "unspecified" in note
+            or "distribution" in note
+        )
+
+        if exact and not is_uncertain:
+            return row_number
+
+        if not exact and is_uncertain:
+            return row_number
+
+    return fallback
+
+
+def copy_row_style(
+    worksheet: Any,
+    source_row: int,
+    target_row: int,
+    max_column: int,
+) -> None:
+    """Copy cell styles and row height without copying cell values."""
+    for column_number in range(1, max_column + 1):
+        source_cell = worksheet.cell(
+            source_row,
+            column_number,
+        )
+        target_cell = worksheet.cell(
+            target_row,
+            column_number,
+        )
+        target_cell._style = copy(source_cell._style)
+        target_cell.font = copy(source_cell.font)
+        target_cell.fill = copy(source_cell.fill)
+        target_cell.border = copy(source_cell.border)
+        target_cell.alignment = copy(source_cell.alignment)
+        target_cell.protection = copy(source_cell.protection)
+        target_cell.number_format = source_cell.number_format
+
+    worksheet.row_dimensions[target_row].height = (
+        worksheet.row_dimensions[source_row].height
+    )
+
+
+def resize_table(
+    worksheet: Any,
+    table_name: str,
+    reference: str,
+) -> None:
+    """Expand a named table when required, but never shrink the template."""
+    if table_name not in worksheet.tables:
+        return
+
+    table: Table = worksheet.tables[table_name]
+    old_min_col, old_min_row, old_max_col, old_max_row = (
+        range_boundaries(table.ref)
+    )
+    new_min_col, new_min_row, new_max_col, new_max_row = (
+        range_boundaries(reference)
+    )
+
+    min_col = min(old_min_col, new_min_col)
+    min_row = min(old_min_row, new_min_row)
+    max_col = max(old_max_col, new_max_col)
+    max_row = max(old_max_row, new_max_row)
+
+    table.ref = (
+        f"{get_column_letter(min_col)}{min_row}:"
+        f"{get_column_letter(max_col)}{max_row}"
+    )
+
+def rewrite_location_sheet(
+    worksheet: Any,
+    records: list[dict[str, Any]],
+    *,
+    table_name: str,
+    cross_sheet: bool,
+) -> None:
+    """Rewrite one location sheet while preserving its template formatting."""
+    exact_style_row = find_sample_row(
+        worksheet,
+        exact=True,
+        fallback=2,
+    )
+    uncertain_style_row = find_sample_row(
+        worksheet,
+        exact=False,
+        fallback=exact_style_row,
+    )
+
+    existing_max_row = worksheet.max_row
+    required_last_row = max(2, len(records) + 1)
+    clear_last_row = max(
+        existing_max_row,
+        required_last_row,
+    )
+
+    for row_number in range(2, clear_last_row + 1):
+        for column_number in range(1, 10):
+            worksheet.cell(
+                row_number,
+                column_number,
+            ).value = None
+
+    for index, record in enumerate(records, start=2):
+        style_row = (
+            uncertain_style_row
+            if record.get("uncertain")
+            else exact_style_row
+        )
+        copy_row_style(
+            worksheet,
+            style_row,
+            index,
+            9,
+        )
+
+        worksheet.cell(index, 1).value = record["date"]
+        worksheet.cell(index, 1).number_format = "yyyy-mm-dd"
+        worksheet.cell(index, 2).value = record["area"]
+        worksheet.cell(index, 3).value = record["location"]
+
+        for trade in REQUIRED_TRADES:
+            worksheet.cell(
+                index,
+                TRADE_COLUMN_MAP[trade],
+            ).value = int(
+                record.get(trade, 0) or 0
+            )
+
+        worksheet.cell(index, 8).value = (
+            f"=SUM(D{index}:G{index})"
+        )
+        worksheet.cell(index, 9).value = record["note"]
+
+    resize_table(
+        worksheet,
+        table_name,
+        f"A1:I{required_last_row}",
+    )
+
+
+def is_reusable_blank_location_row(
+    worksheet: Any,
+    row_number: int,
+) -> bool:
+    """Return True for an unused/template data row."""
+    date_value = parse_date_value(
+        worksheet.cell(row_number, 1).value
+    )
+    area = clean_cell(worksheet.cell(row_number, 2).value)
+    location = clean_cell(worksheet.cell(row_number, 3).value)
+    note = clean_cell(worksheet.cell(row_number, 9).value)
+
+    trade_total = sum(
+        to_non_negative_int(
+            worksheet.cell(
+                row_number,
+                TRADE_COLUMN_MAP[trade],
+            ).value
+        )
+        or 0
+        for trade in REQUIRED_TRADES
+    )
+
+    return (
+        date_value is None
+        and not area
+        and not location
+        and trade_total == 0
+        and not note
+    )
+
+
+def read_location_records_for_date(
+    worksheet: Any,
+    report_date: date,
+    row_numbers: list[int],
+) -> list[dict[str, Any]]:
+    """Read populated rows for one date without touching other dates."""
+    records: list[dict[str, Any]] = []
+
+    for row_number in row_numbers:
+        if parse_date_value(
+            worksheet.cell(row_number, 1).value
+        ) != report_date:
+            continue
+
+        area = clean_cell(
+            worksheet.cell(row_number, 2).value
+        )
+        location = clean_cell(
+            worksheet.cell(row_number, 3).value
+        )
+
+        if not area or not location:
+            continue
+
+        values = {
+            trade: (
+                to_non_negative_int(
+                    worksheet.cell(
+                        row_number,
+                        TRADE_COLUMN_MAP[trade],
+                    ).value
+                )
+                or 0
+            )
+            for trade in REQUIRED_TRADES
+        }
+
+        records.append(
+            {
+                "date": report_date,
+                "area": area,
+                "location": location,
+                **values,
+                "note": clean_cell(
+                    worksheet.cell(row_number, 9).value
+                ),
+                "uncertain": bool(
+                    worksheet.cell(row_number, 1).fill
+                    and worksheet.cell(row_number, 1).fill.fill_type
+                    and worksheet.cell(row_number, 1).fill.fgColor.rgb
+                    not in {None, "00000000", "FFFFFFFF"}
+                )
+                or "unspecified"
+                in clean_cell(
+                    worksheet.cell(row_number, 9).value
+                ).lower()
+                or "distribution"
+                in clean_cell(
+                    worksheet.cell(row_number, 9).value
+                ).lower(),
+            }
+        )
+
+    return records
+
+
+def find_location_insertion_row(
+    worksheet: Any,
+    report_date: date,
+    scan_last_row: int,
+) -> int:
+    """Find where a new date block should be written."""
+    last_dated_row = 1
+
+    for row_number in range(2, scan_last_row + 1):
+        existing_date = parse_date_value(
+            worksheet.cell(row_number, 1).value
+        )
+
+        if existing_date is None:
+            continue
+
+        if existing_date > report_date:
+            return row_number
+
+        last_dated_row = row_number
+
+    return last_dated_row + 1
+
+
+def clear_location_row_values(
+    worksheet: Any,
+    row_number: int,
+) -> None:
+    """Clear A:I values while retaining the row's formatting."""
+    for column_number in range(1, 10):
+        worksheet.cell(
+            row_number,
+            column_number,
+        ).value = None
+
+
+def write_location_record(
+    worksheet: Any,
+    row_number: int,
+    record: dict[str, Any],
+    exact_style_row: int,
+    uncertain_style_row: int,
+) -> None:
+    """Write one location record using the matching template style."""
+    style_row = (
+        uncertain_style_row
+        if record.get("uncertain")
+        else exact_style_row
+    )
+    copy_row_style(worksheet, style_row, row_number, 9)
+
+    worksheet.cell(row_number, 1).value = record["date"]
+    worksheet.cell(row_number, 1).number_format = "yyyy-mm-dd"
+    worksheet.cell(row_number, 2).value = record["area"]
+    worksheet.cell(row_number, 3).value = record["location"]
+
+    for trade in REQUIRED_TRADES:
+        worksheet.cell(
+            row_number,
+            TRADE_COLUMN_MAP[trade],
+        ).value = int(record.get(trade, 0) or 0)
+
+    worksheet.cell(row_number, 8).value = (
+        f"=SUM(D{row_number}:G{row_number})"
+    )
+    worksheet.cell(row_number, 9).value = record["note"]
+
+    if record.get("uncertain"):
+        yellow_fill = PatternFill(
+            fill_type="solid",
+            fgColor="FFF2CC",
+        )
+        for column_number in range(1, 10):
+            worksheet.cell(
+                row_number,
+                column_number,
+            ).fill = copy(yellow_fill)
+
+
+def update_location_sheet_preserving_history(
+    worksheet: Any,
+    new_records: list[dict[str, Any]],
+    update_scope: dict[date, set[str]],
+    *,
+    table_name: str,
+    cross_sheet: bool,
+) -> int:
+    """Update only affected date blocks; leave all older rows untouched."""
+    exact_style_row = find_sample_row(
+        worksheet,
+        exact=True,
+        fallback=2,
+    )
+    uncertain_style_row = find_sample_row(
+        worksheet,
+        exact=False,
+        fallback=exact_style_row,
+    )
+
+    if table_name in worksheet.tables:
+        _, _, _, table_last_row = range_boundaries(
+            worksheet.tables[table_name].ref
+        )
+    else:
+        table_last_row = worksheet.max_row
+
+    for report_date in sorted(update_scope):
+        date_rows = [
+            row_number
+            for row_number in range(2, table_last_row + 1)
+            if parse_date_value(
+                worksheet.cell(row_number, 1).value
+            )
+            == report_date
+        ]
+
+        existing_records = read_location_records_for_date(
+            worksheet,
+            report_date,
+            date_rows,
+        )
+        date_new_records = [
+            record
+            for record in new_records
+            if record["date"] == report_date
+        ]
+
+        merged_records = merge_location_updates(
+            existing_records,
+            date_new_records,
+            {report_date: update_scope[report_date]},
+        )
+
+        if cross_sheet:
+            merged_records.sort(
+                key=lambda record: (
+                    record["location"].upper(),
+                    record["area"].upper(),
+                )
+            )
+        else:
+            merged_records.sort(
+                key=workbook_record_sort_key
+            )
+
+        if date_rows:
+            start_row = min(date_rows)
+            capacity_end = max(date_rows)
+        else:
+            start_row = find_location_insertion_row(
+                worksheet,
+                report_date,
+                table_last_row,
+            )
+            capacity_end = start_row - 1
+
+        needed_rows = len(merged_records)
+        capacity = max(0, capacity_end - start_row + 1)
+
+        # Reuse existing blank template rows before inserting anything.
+        while capacity < needed_rows:
+            next_row = start_row + capacity
+
+            if next_row <= table_last_row and (
+                next_row in date_rows
+                or is_reusable_blank_location_row(
+                    worksheet,
+                    next_row,
+                )
+            ):
+                capacity += 1
+                capacity_end = next_row
+                continue
+
+            # A later populated row blocks the date block, so insert rows.
+            insert_count = needed_rows - capacity
+            worksheet.insert_rows(
+                next_row,
+                amount=insert_count,
+            )
+            table_last_row += insert_count
+            capacity += insert_count
+            capacity_end += insert_count
+            break
+
+        for offset, record in enumerate(merged_records):
+            write_location_record(
+                worksheet,
+                start_row + offset,
+                record,
+                exact_style_row,
+                uncertain_style_row,
+            )
+
+        # Clear unused placeholder/date rows but do not rewrite other dates.
+        for row_number in range(
+            start_row + needed_rows,
+            capacity_end + 1,
+        ):
+            clear_location_row_values(
+                worksheet,
+                row_number,
+            )
+
+    resize_table(
+        worksheet,
+        table_name,
+        f"A1:I{max(2, table_last_row)}",
+    )
+
+    return sum(
+        1
+        for row_number in range(2, table_last_row + 1)
+        if parse_date_value(
+            worksheet.cell(row_number, 1).value
+        )
+        is not None
+        and clean_cell(
+            worksheet.cell(row_number, 2).value
+        )
+        and clean_cell(
+            worksheet.cell(row_number, 3).value
+        )
+    )
+
+
+def read_daily_master_rows(
+    worksheet: Any,
+) -> dict[date, int]:
+    """Map existing Daily Master dates to row numbers."""
+    result: dict[date, int] = {}
+
+    for row_number in range(2, worksheet.max_row + 1):
+        report_date = parse_date_value(
+            worksheet.cell(row_number, 1).value
+        )
+        if report_date is not None:
+            result[report_date] = row_number
+
+    return result
+
+
+def find_first_blank_daily_row(
+    worksheet: Any,
+) -> int:
+    """Find the first preformatted blank row in Daily Master."""
+    for row_number in range(2, worksheet.max_row + 1):
+        if parse_date_value(
+            worksheet.cell(row_number, 1).value
+        ) is None:
+            return row_number
+
+    return worksheet.max_row + 1
+
+
+def update_daily_master(
+    worksheet: Any,
+    updates: dict[date, dict[str, int]],
+) -> list[dict[str, Any]]:
+    """Update only uploaded trades and leave other trade cells unchanged."""
+    existing_rows = read_daily_master_rows(worksheet)
+    sample_row = (
+        min(existing_rows.values())
+        if existing_rows
+        else 2
+    )
+    changes: list[dict[str, Any]] = []
+
+    for report_date in sorted(updates):
+        row_number = existing_rows.get(report_date)
+
+        if row_number is None:
+            row_number = find_first_blank_daily_row(
+                worksheet
+            )
+            copy_row_style(
+                worksheet,
+                sample_row,
+                row_number,
+                6,
+            )
+            worksheet.cell(
+                row_number,
+                1,
+            ).value = report_date
+            worksheet.cell(
+                row_number,
+                1,
+            ).number_format = "yyyy-mm-dd"
+            existing_rows[report_date] = row_number
+
+        for trade, new_value in updates[report_date].items():
+            column_number = DAILY_TRADE_COLUMN_MAP[trade]
+            old_value = to_non_negative_int(
+                worksheet.cell(
+                    row_number,
+                    column_number,
+                ).value
+            )
+
+            worksheet.cell(
+                row_number,
+                column_number,
+            ).value = new_value
+
+            if old_value is None:
+                action = "填入空白"
+            elif old_value == new_value:
+                action = "數值不變"
+            else:
+                action = "更新原有數值"
+
+            changes.append(
+                {
+                    "日期": report_date.isoformat(),
+                    "工種": trade,
+                    "原有數值": old_value,
+                    "新數值": new_value,
+                    "操作": action,
+                }
+            )
+
+        worksheet.cell(
+            row_number,
+            6,
+        ).value = f"=SUM(B{row_number}:E{row_number})"
+
+    last_used_row = max(existing_rows.values()) if existing_rows else 2
+
+    resize_table(
+        worksheet,
+        "DailyMasterTable",
+        f"A1:F{max(2, last_used_row)}",
+    )
+
+    return changes
+
+
+def build_excel_location_records(
+    summary_records: list[dict[str, Any]],
+    *,
+    review: bool,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    """Convert app summaries into Location Detail and Cross-F records."""
+    location_records: list[dict[str, Any]] = []
+    cross_records: list[dict[str, Any]] = []
+
+    for summary in summary_records:
+        report_date = parse_date_value(
+            summary.get("日期")
+        )
+        standard_location = clean_cell(
+            summary.get("標準位置")
+        )
+
+        if report_date is None or not standard_location:
+            continue
+
+        trade_values = {
+            trade: (
+                to_non_negative_int(
+                    summary.get(trade)
+                )
+                or 0
+            )
+            for trade in REQUIRED_TRADES
+        }
+
+        if sum(trade_values.values()) <= 0:
+            continue
+
+        if review and not is_single_area_uncertain_location(
+            standard_location
+        ):
+            area, location, uncertain, note = (
+                format_cross_floor_location(
+                    standard_location
+                )
+            )
+
+            cross_records.append(
+                {
+                    "date": report_date,
+                    "area": area,
+                    "location": location,
+                    **trade_values,
+                    "note": note,
+                    "uncertain": uncertain,
+                }
+            )
+            continue
+
+        area, location, note, uncertain = (
+            standard_location_to_workbook(
+                standard_location
+            )
+        )
+
+        location_records.append(
+            {
+                "date": report_date,
+                "area": area,
+                "location": location,
+                **trade_values,
+                "note": note,
+                "uncertain": uncertain,
+            }
+        )
+
+    return location_records, cross_records
+
+
+def update_summary_formulas(
+    workbook: Any,
+) -> None:
+    """Extend summary formulas to the current Daily Master table."""
+    daily_sheet = workbook["Daily Master"]
+    last_daily_row = 2
+
+    for row_number in range(
+        daily_sheet.max_row,
+        1,
+        -1,
+    ):
+        if parse_date_value(
+            daily_sheet.cell(row_number, 1).value
+        ) is not None:
+            last_daily_row = row_number
+            break
+
+    department_sheet = workbook["Department Summary"]
+    department_sheet["B2"] = (
+        f"=SUM('Daily Master'!B2:B{last_daily_row})"
+    )
+    department_sheet["B3"] = (
+        f"=SUM('Daily Master'!C2:C{last_daily_row})"
+    )
+    department_sheet["B4"] = (
+        f"=SUM('Daily Master'!D2:D{last_daily_row})"
+    )
+    department_sheet["B5"] = (
+        f"=SUM('Daily Master'!E2:E{last_daily_row})"
+    )
+    department_sheet["B6"] = "=SUM(B2:B5)"
+
+    overview_sheet = workbook["Overview"]
+    overview_sheet["B6"] = "=MAX('Daily Master'!A:A)"
+    overview_sheet["B7"] = "='Department Summary'!B6"
+    overview_sheet["B8"] = "='Department Summary'!B2"
+    overview_sheet["B9"] = "='Department Summary'!B3"
+    overview_sheet["B10"] = "='Department Summary'!B4"
+    overview_sheet["B11"] = "='Department Summary'!B5"
+    overview_sheet["B12"] = (
+        f"=COUNTA('Daily Master'!A2:A{last_daily_row})"
+    )
+
+
+def export_updated_workbook(
+    *,
+    template_bytes: bytes,
+    summary_rows: list[dict[str, Any]],
+    confirmed_records: list[dict[str, Any]],
+    review_records: list[dict[str, Any]],
+) -> tuple[bytes, dict[str, Any]]:
+    """Update a copy of the template and return downloadable XLSX bytes."""
+    workbook = load_workbook(
+        io.BytesIO(template_bytes),
+        data_only=False,
+    )
+
+    missing_sheets = [
+        sheet_name
+        for sheet_name in EXCEL_REQUIRED_SHEETS
+        if sheet_name not in workbook.sheetnames
+    ]
+    if missing_sheets:
+        raise ValueError(
+            "Excel模板缺少工作表："
+            + ", ".join(missing_sheets)
+        )
+
+    daily_updates, update_scope, duplicate_keys = (
+        build_daily_updates(summary_rows)
+    )
+
+    if not update_scope:
+        raise ValueError(
+            "分析結果中沒有可用的日期及工種，"
+            "無法更新Excel。"
+        )
+
+    daily_changes = update_daily_master(
+        workbook["Daily Master"],
+        daily_updates,
+    )
+
+    confirmed_location_records, confirmed_cross_records = (
+        build_excel_location_records(
+            confirmed_records,
+            review=False,
+        )
+    )
+    review_location_records, review_cross_records = (
+        build_excel_location_records(
+            review_records,
+            review=True,
+        )
+    )
+
+    new_location_records = (
+        confirmed_location_records
+        + review_location_records
+    )
+    new_cross_records = (
+        confirmed_cross_records
+        + review_cross_records
+    )
+
+    location_sheet = workbook["Location Detail"]
+    cross_sheet = workbook[
+        "Cross-F & distribution U"
+    ]
+
+    location_row_count = update_location_sheet_preserving_history(
+        location_sheet,
+        new_location_records,
+        update_scope,
+        table_name="LocationDetailTable",
+        cross_sheet=False,
+    )
+    cross_row_count = update_location_sheet_preserving_history(
+        cross_sheet,
+        new_cross_records,
+        update_scope,
+        table_name="CrossFloorUnspecifiedTable",
+        cross_sheet=True,
+    )
+
+    update_summary_formulas(workbook)
+
+    try:
+        workbook.calculation.fullCalcOnLoad = True
+        workbook.calculation.forceFullCalc = True
+        workbook.calculation.calcMode = "auto"
+    except Exception:
+        pass
+
+    output_buffer = io.BytesIO()
+    workbook.save(output_buffer)
+
+    preview = {
+        "daily_changes": daily_changes,
+        "location_rows": location_row_count,
+        "cross_rows": cross_row_count,
+        "updated_dates": [
+            report_date.isoformat()
+            for report_date in sorted(update_scope)
+        ],
+        "updated_scope": [
+            (
+                report_date.isoformat()
+                + "："
+                + ", ".join(
+                    sorted(update_scope[report_date])
+                )
+            )
+            for report_date in sorted(update_scope)
+        ],
+        "duplicate_keys": duplicate_keys,
+    }
+
+    return output_buffer.getvalue(), preview
+
+
 # =========================================================
 # Page title
 # =========================================================
@@ -2030,6 +3455,13 @@ if analysis_results:
             build_location_summary(edited_detail_df)
         )
 
+        st.session_state["confirmed_summary_records"] = (
+            confirmed_summary_df.to_dict("records")
+        )
+        st.session_state["review_summary_records"] = (
+            review_summary_df.to_dict("records")
+        )
+
         if not confirmed_summary_df.empty:
             total_confirmed = int(confirmed_summary_df["合計"].sum())
 
@@ -2089,3 +3521,176 @@ if analysis_results:
         for result in analysis_results:
             st.markdown(f"#### {result['summary']['文件']}")
             st.text(result["raw_text"] or "沒有提取到文字。")
+
+# =========================================================
+# Section 7: Excel template update and export
+# =========================================================
+
+st.divider()
+st.subheader("7. 更新原有Excel工作簿")
+
+if not analysis_results:
+    st.info("請先完成PDF分析，才可以更新Excel。")
+else:
+    confirmed_export_records = st.session_state.get(
+        "confirmed_summary_records",
+        [],
+    )
+    review_export_records = st.session_state.get(
+        "review_summary_records",
+        [],
+    )
+
+    st.write(
+        "上傳你原有的Manpower Excel模板。"
+        "系統只會建立一份新的下載檔案，不會改動原始檔。"
+    )
+
+    excel_template_file = st.file_uploader(
+        "上傳Excel模板（.xlsx）",
+        type=["xlsx"],
+        accept_multiple_files=False,
+        key="excel_template_uploader_v052",
+    )
+
+    if excel_template_file is not None:
+        st.success(
+            f"已讀取模板：{excel_template_file.name}"
+        )
+
+        st.caption(
+            "更新規則：Daily Master使用Today Total Manpower；"
+            "同一日期只更新本次已分析的工種，其他工種保持原樣；"
+            "只會重建本次更新日期的資料；較早日期的排列、內容及格式保持原樣。"
+        )
+
+        if st.button(
+            "建立Excel更新預覽",
+            type="primary",
+            width="stretch",
+        ):
+            try:
+                export_bytes, export_preview = (
+                    export_updated_workbook(
+                        template_bytes=(
+                            excel_template_file.getvalue()
+                        ),
+                        summary_rows=summary_rows,
+                        confirmed_records=(
+                            confirmed_export_records
+                        ),
+                        review_records=review_export_records,
+                    )
+                )
+
+                st.session_state[
+                    "excel_export_bytes_v052"
+                ] = export_bytes
+                st.session_state[
+                    "excel_export_preview_v052"
+                ] = export_preview
+                st.session_state[
+                    "excel_export_template_name_v052"
+                ] = excel_template_file.name
+
+                st.success(
+                    "Excel更新預覽已建立。"
+                )
+
+            except Exception as error:
+                st.session_state.pop(
+                    "excel_export_bytes_v052",
+                    None,
+                )
+                st.session_state.pop(
+                    "excel_export_preview_v052",
+                    None,
+                )
+                st.error("建立Excel時發生錯誤。")
+                st.exception(error)
+
+    export_bytes = st.session_state.get(
+        "excel_export_bytes_v052"
+    )
+    export_preview = st.session_state.get(
+        "excel_export_preview_v052"
+    )
+
+    if export_bytes and export_preview:
+        st.markdown("### 預計更新內容")
+
+        metric1, metric2, metric3 = st.columns(3)
+        metric1.metric(
+            "更新日期數量",
+            len(export_preview["updated_dates"]),
+        )
+        metric2.metric(
+            "Location Detail總列數",
+            export_preview["location_rows"],
+        )
+        metric3.metric(
+            "Cross-F總列數",
+            export_preview["cross_rows"],
+        )
+
+        for scope_text in export_preview[
+            "updated_scope"
+        ]:
+            st.info(scope_text)
+
+        daily_change_df = pd.DataFrame(
+            export_preview["daily_changes"]
+        )
+
+        if not daily_change_df.empty:
+            st.markdown("#### Daily Master變更預覽")
+            st.dataframe(
+                daily_change_df,
+                width="stretch",
+                hide_index=True,
+            )
+
+        duplicate_keys = export_preview.get(
+            "duplicate_keys",
+            [],
+        )
+        if duplicate_keys:
+            st.warning(
+                "同一日期及工種出現多份分析結果，"
+                "目前使用最後一份："
+                + ", ".join(duplicate_keys)
+            )
+
+        latest_date_text = max(
+            export_preview["updated_dates"]
+        ).replace("-", "")
+
+        original_template_name = st.session_state.get(
+            "excel_export_template_name_v052",
+            "Manpower.xlsx",
+        )
+        original_stem = Path(
+            original_template_name
+        ).stem
+
+        output_filename = (
+            f"{original_stem}_updated_"
+            f"{latest_date_text}.xlsx"
+        )
+
+        st.download_button(
+            "下載更新後Excel",
+            data=export_bytes,
+            file_name=output_filename,
+            mime=(
+                "application/vnd.openxmlformats-"
+                "officedocument.spreadsheetml.sheet"
+            ),
+            type="primary",
+            width="stretch",
+        )
+
+        st.warning(
+            "下載後先在Excel中檢查今日資料。"
+            "原始模板不會被覆蓋。"
+        )
