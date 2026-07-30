@@ -29,7 +29,7 @@ st.set_page_config(
 )
 
 REQUIRED_TRADES = ("AC", "EL", "FS", "PD")
-APP_VERSION = "0.7.0 — New project Excel"
+APP_VERSION = "0.7.2 — Worker location fix"
 PARSER_MODE_OPTIONS = {
     "自動偵測": "auto",
     "Location＋Manpower數字欄": "numeric_table",
@@ -851,41 +851,255 @@ def build_worker_location_result(
     location_raw: str,
     config: dict[str, Any],
 ) -> tuple[str, str, str, str]:
-    """Standardise worker-table locations without inventing a floor split."""
+    """Standardise one Worker-table location without inventing a split.
+
+    Important rule:
+    A location such as ``Basement, 1/F`` is not Podium / 1F.
+    It is a grouped multi-location record and must be retained once as
+    ``Distribution U / Basement + 1F``.
+    """
     original = clean_cell(location_raw)
-    upper = original.upper().replace("＆", "&")
+    upper = (
+        original.upper()
+        .replace("＆", "&")
+        .replace("，", ",")
+        .replace("、", ",")
+    )
 
-    if not original or upper in {"N/A", "NA", "NIL", "NONE", "ALL SITE", "SITE"}:
-        return "Unspecified", "", "", "需人工確認位置"
+    if (
+        not original
+        or upper
+        in {
+            "N/A",
+            "NA",
+            "NIL",
+            "NONE",
+            "ALL SITE",
+            "SITE",
+        }
+    ):
+        return (
+            "Unspecified",
+            "",
+            "",
+            "需人工確認位置",
+        )
 
-    # Exact tower/floor or exact floor references can use the normal parser.
     floors = extract_floor_tokens(original)
     towers = extract_towers(original)
 
-    if floors:
-        return build_location_result(original, original, config)
+    # Recover an exact worker-table form such as "T1 9/F".
+    # The general floor parser removes spaces, which can otherwise make
+    # T1 9/F look like one compact token.
+    exact_tower_floor_match = re.fullmatch(
+        r"\s*T\s*(\d+)\s+(\d+)\s*/?\s*F\s*",
+        original,
+        re.I,
+    )
+    if exact_tower_floor_match:
+        towers = [
+            f"T{int(exact_tower_floor_match.group(1))}"
+        ]
+        floors = [
+            f"{int(exact_tower_floor_match.group(2))}F"
+        ]
 
-    has_basement = "BASEMENT" in upper
-    has_podium = "PODIUM" in upper
-    tower_word_only = upper.strip() in {"TOWER", "TOWERS"}
-
-    components: list[str] = []
-    if has_basement:
-        components.append("Basement")
-    if has_podium:
-        components.append("Podium")
-    components.extend(towers)
-
-    # Remove duplicates but keep a stable readable order.
-    unique_components: list[str] = []
-    for component in components:
-        if component not in unique_components:
-            unique_components.append(component)
+    has_basement = bool(
+        re.search(r"\bBASEMENT\b", upper)
+    )
+    has_podium = bool(
+        re.search(r"\bPODIUM\b", upper)
+    )
+    tower_word_only = (
+        upper.strip() in {"TOWER", "TOWERS"}
+    )
 
     tower_text = ", ".join(towers)
+    floor_text = ", ".join(floors)
 
     if tower_word_only:
-        return "Unspecified Tower / Floor U", "", "", "需人工確認樓座及樓層"
+        return (
+            "Unspecified Tower / Floor U",
+            "",
+            "",
+            "需人工確認樓座及樓層",
+        )
+
+    basement_floors = set(
+        config.get("basement_floors", [])
+    )
+    podium_floors = set(
+        config.get("podium_floors", [])
+    )
+
+    # -----------------------------------------------------
+    # Detect grouped area + floor references first.
+    # This prevents "Basement, 1/F" from being misread as
+    # an exact Podium / 1F record.
+    # -----------------------------------------------------
+    non_basement_floors = [
+        floor
+        for floor in floors
+        if floor not in basement_floors
+        and not floor.startswith("B")
+    ]
+    non_podium_floors = [
+        floor
+        for floor in floors
+        if floor not in podium_floors
+    ]
+
+    if has_basement and (
+        has_podium
+        or towers
+        or non_basement_floors
+    ):
+        components: list[str] = ["Basement"]
+
+        if has_podium:
+            components.append("Podium")
+
+        components.extend(towers)
+
+        for floor in non_basement_floors:
+            if floor not in components:
+                components.append(floor)
+
+        label = " + ".join(
+            dict.fromkeys(components)
+        )
+        return (
+            f"Distribution U / {label}",
+            tower_text,
+            floor_text,
+            "位置分布未指定，不作假設分配",
+        )
+
+    if has_podium and (
+        has_basement
+        or towers
+        or non_podium_floors
+    ):
+        components = ["Podium"]
+
+        if has_basement:
+            components.insert(0, "Basement")
+
+        components.extend(towers)
+
+        for floor in non_podium_floors:
+            if floor not in components:
+                components.append(floor)
+
+        label = " + ".join(
+            dict.fromkeys(components)
+        )
+        return (
+            f"Distribution U / {label}",
+            tower_text,
+            floor_text,
+            "位置分布未指定，不作假設分配",
+        )
+
+    # More than one tower is always a distribution record,
+    # even when one floor is also stated.
+    if len(towers) > 1:
+        components = list(towers)
+
+        for floor in floors:
+            if floor not in components:
+                components.append(floor)
+
+        label = " + ".join(
+            dict.fromkeys(components)
+        )
+        return (
+            f"Distribution U / {label}",
+            tower_text,
+            floor_text,
+            "位置分布未指定，不作假設分配",
+        )
+
+    # A single tower plus one exact floor is a valid exact
+    # tower-floor record. Multiple floors remain Cross-floor.
+    if len(towers) == 1 and floors:
+        if len(floors) == 1:
+            return (
+                f"{towers[0]} / {floors[0]}",
+                towers[0],
+                floors[0],
+                "已解析",
+            )
+
+        readable_floors = " + ".join(floors)
+        return (
+            (
+                f"Cross-floor / {towers[0]} / "
+                f"{readable_floors}"
+            ),
+            towers[0],
+            readable_floors,
+            "跨樓層／多位置，人數分布未指定",
+        )
+
+    # Explicit Basement or Podium with compatible floor(s).
+    if has_basement and floors:
+        if len(floors) == 1:
+            return (
+                f"Basement / {floors[0]}",
+                "",
+                floors[0],
+                "已解析",
+            )
+
+        readable_floors = " + ".join(floors)
+        return (
+            f"Cross-floor / {readable_floors}",
+            "",
+            readable_floors,
+            "跨樓層／多位置，人數分布未指定",
+        )
+
+    if has_podium and floors:
+        if len(floors) == 1:
+            return (
+                f"Podium / {floors[0]}",
+                "",
+                floors[0],
+                "已解析",
+            )
+
+        readable_floors = " + ".join(floors)
+        return (
+            f"Cross-floor / {readable_floors}",
+            "",
+            readable_floors,
+            "跨樓層／多位置，人數分布未指定",
+        )
+
+    # Bare exact floor references continue to use project
+    # configuration. For example, a standalone 3/F can still
+    # become Podium / 3F where 3F is configured as Podium.
+    if floors:
+        return build_location_result(
+            original,
+            original,
+            config,
+        )
+
+    components: list[str] = []
+
+    if has_basement:
+        components.append("Basement")
+
+    if has_podium:
+        components.append("Podium")
+
+    components.extend(towers)
+
+    unique_components = list(
+        dict.fromkeys(components)
+    )
 
     if len(unique_components) > 1:
         label = " + ".join(unique_components)
@@ -912,7 +1126,7 @@ def build_worker_location_result(
             "需人工確認樓層",
         )
 
-    if len(towers) == 1 and len(unique_components) == 1:
+    if len(towers) == 1:
         return (
             f"{towers[0]} / Floor U",
             towers[0],
@@ -920,8 +1134,12 @@ def build_worker_location_result(
             "需人工確認樓層",
         )
 
-    return original, tower_text, "", "需人工確認位置"
-
+    return (
+        original,
+        tower_text,
+        "",
+        "需人工確認位置",
+    )
 
 def analyse_worker_table_pdf(
     file_data: dict[str, Any],
@@ -5189,4 +5407,3 @@ else:
             "更新模式不會覆蓋原始檔；"
             "新工程模式不會包含舊工程歷史資料。"
         )
-        
