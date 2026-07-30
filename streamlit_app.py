@@ -10,10 +10,16 @@ from typing import Any
 import pandas as pd
 import pdfplumber
 import streamlit as st
-from openpyxl import load_workbook
-from openpyxl.styles import PatternFill
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import (
+    Alignment,
+    Border,
+    Font,
+    PatternFill,
+    Side,
+)
 from openpyxl.utils.cell import get_column_letter, range_boundaries
-from openpyxl.worksheet.table import Table
+from openpyxl.worksheet.table import Table, TableStyleInfo
 
 
 st.set_page_config(
@@ -23,7 +29,7 @@ st.set_page_config(
 )
 
 REQUIRED_TRADES = ("AC", "EL", "FS", "PD")
-APP_VERSION = "0.5.2 — Safe Excel update"
+APP_VERSION = "0.7.0 — New project Excel"
 PARSER_MODE_OPTIONS = {
     "自動偵測": "auto",
     "Location＋Manpower數字欄": "numeric_table",
@@ -1559,6 +1565,507 @@ def analyse_report_pdf(
 # =========================================================
 
 
+# =========================================================
+# Built-in blank workbook template
+# =========================================================
+
+
+MASTER_HEADER_FILL = "1F4E78"
+MASTER_HEADER_FONT = "FFFFFF"
+MASTER_LIGHT_BLUE_FILL = "D9EAF7"
+MASTER_DARK_BLUE_FONT = "203864"
+MASTER_YELLOW_FILL = "FFF2CC"
+MASTER_GRID_COLOR = "D9E2F3"
+
+
+def safe_filename_part(value: str) -> str:
+    """Return a Windows/macOS-safe filename component."""
+    cleaned = re.sub(
+        r'[\\/:*?"<>|]+',
+        "_",
+        clean_cell(value),
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    return cleaned or "New_Project"
+
+
+def set_master_header_style(
+    worksheet: Any,
+    cell_range: str,
+) -> None:
+    """Apply the workbook's dark-blue table header style."""
+    header_fill = PatternFill(
+        fill_type="solid",
+        fgColor=MASTER_HEADER_FILL,
+    )
+    header_font = Font(
+        name="Times New Roman",
+        size=12,
+        bold=True,
+        color=MASTER_HEADER_FONT,
+    )
+    header_alignment = Alignment(
+        horizontal="center",
+        vertical="center",
+    )
+    thin_side = Side(
+        style="thin",
+        color=MASTER_GRID_COLOR,
+    )
+    header_border = Border(
+        left=thin_side,
+        right=thin_side,
+        top=thin_side,
+        bottom=thin_side,
+    )
+
+    for row in worksheet[cell_range]:
+        for cell in row:
+            cell.fill = copy(header_fill)
+            cell.font = copy(header_font)
+            cell.alignment = copy(header_alignment)
+            cell.border = copy(header_border)
+
+
+def set_master_body_style(
+    worksheet: Any,
+    cell_range: str,
+    *,
+    yellow: bool = False,
+) -> None:
+    """Apply the standard Times New Roman body style."""
+    body_font = Font(
+        name="Times New Roman",
+        size=12,
+        color="000000",
+    )
+    body_fill = PatternFill(
+        fill_type="solid",
+        fgColor=(
+            MASTER_YELLOW_FILL
+            if yellow
+            else "FFFFFF"
+        ),
+    )
+    thin_side = Side(
+        style="thin",
+        color=MASTER_GRID_COLOR,
+    )
+    body_border = Border(
+        left=thin_side,
+        right=thin_side,
+        top=thin_side,
+        bottom=thin_side,
+    )
+
+    for row in worksheet[cell_range]:
+        for cell in row:
+            cell.font = copy(body_font)
+            cell.fill = copy(body_fill)
+            cell.border = copy(body_border)
+            cell.alignment = Alignment(
+                vertical="center",
+                wrap_text=(
+                    cell.column in {3, 9}
+                ),
+            )
+
+
+def add_master_table(
+    worksheet: Any,
+    reference: str,
+    table_name: str,
+) -> None:
+    """Add a blue banded Excel table matching the current workbook."""
+    table = Table(
+        displayName=table_name,
+        ref=reference,
+    )
+    table.tableStyleInfo = TableStyleInfo(
+        name="TableStyleMedium2",
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=True,
+        showColumnStripes=False,
+    )
+    worksheet.add_table(table)
+
+
+def create_blank_master_template_bytes(
+    config: dict[str, Any],
+) -> bytes:
+    """Create a completely new blank workbook in the current master layout."""
+    workbook = Workbook()
+    default_sheet = workbook.active
+    workbook.remove(default_sheet)
+
+    project_name = clean_cell(
+        config.get("project_name")
+    ) or "New Project"
+
+    # -----------------------------------------------------
+    # Overview
+    # -----------------------------------------------------
+    overview = workbook.create_sheet("Overview")
+    overview.merge_cells("A1:D1")
+    overview["A1"] = f"{project_name} Manpower Overview"
+    overview["A1"].fill = PatternFill(
+        fill_type="solid",
+        fgColor=MASTER_HEADER_FILL,
+    )
+    overview["A1"].font = Font(
+        name="Times New Roman",
+        size=16,
+        bold=True,
+        color=MASTER_HEADER_FONT,
+    )
+    overview["A1"].alignment = Alignment(
+        horizontal="center",
+        vertical="center",
+    )
+    overview.row_dimensions[1].height = 28
+
+    overview["A4"] = "Metric"
+    overview["B4"] = "Value"
+    overview["D4"] = "How to use the location analysis"
+    set_master_header_style(overview, "A4:B4")
+    set_master_header_style(overview, "D4:D4")
+
+    overview_rows = [
+        (
+            "Start Date",
+            '=IFERROR(MIN(\'Daily Master\'!A:A),"")',
+        ),
+        (
+            "Last Updated",
+            '=IFERROR(MAX(\'Daily Master\'!A:A),"")',
+        ),
+        (
+            "Total Manpower",
+            "='Department Summary'!B6",
+        ),
+        ("AC", "='Department Summary'!B2"),
+        ("EL", "='Department Summary'!B3"),
+        ("FS", "='Department Summary'!B4"),
+        ("PD", "='Department Summary'!B5"),
+        (
+            "Days with Reports",
+            '=COUNT(\'Daily Master\'!A:A)',
+        ),
+    ]
+    for row_number, (metric, formula) in enumerate(
+        overview_rows,
+        start=5,
+    ):
+        overview.cell(row_number, 1).value = metric
+        overview.cell(row_number, 2).value = formula
+
+    overview["D5"] = (
+        "Use “Location Detail” to filter by date, trade, tower or "
+        "work location. Cross-floor and multi-location records are "
+        "kept once in “Cross-F & distribution U” when the reports do "
+        "not state the exact worker distribution."
+    )
+    overview.merge_cells("D5:D12")
+
+    set_master_body_style(overview, "A5:B12")
+    set_master_body_style(overview, "D5:D12")
+    overview["D5"].alignment = Alignment(
+        vertical="top",
+        wrap_text=True,
+    )
+    overview["B5"].number_format = "yyyy-mm-dd"
+    overview["B6"].number_format = "yyyy-mm-dd"
+    overview["A12"].fill = PatternFill(
+        fill_type="solid",
+        fgColor=MASTER_LIGHT_BLUE_FILL,
+    )
+    overview["B12"].fill = PatternFill(
+        fill_type="solid",
+        fgColor=MASTER_LIGHT_BLUE_FILL,
+    )
+    overview["A12"].font = Font(
+        name="Times New Roman",
+        size=12,
+        bold=True,
+        color=MASTER_DARK_BLUE_FONT,
+    )
+    overview["B12"].font = copy(overview["A12"].font)
+    overview.column_dimensions["A"].width = 23
+    overview.column_dimensions["B"].width = 18
+    overview.column_dimensions["C"].width = 3
+    overview.column_dimensions["D"].width = 58
+    overview.freeze_panes = "A4"
+
+    # -----------------------------------------------------
+    # Data Rules
+    # -----------------------------------------------------
+    rules = workbook.create_sheet("Data Rules")
+    rules.append(
+        [
+            "Rule / Item",
+            "Definition used in this workbook",
+        ]
+    )
+
+    basement_text = ", ".join(
+        config.get("basement_floors", [])
+    ) or "No basement floors configured"
+    towers_text = ", ".join(
+        config.get("towers", [])
+    ) or "No towers configured"
+
+    rule_rows = [
+        [
+            "Master manpower count",
+            (
+                "Taken from Section 'Today Total Manpower' of each "
+                "daily report. Confirmed duplicate reports are counted once."
+            ),
+        ],
+        [
+            "Main Location Detail",
+            (
+                "Contains only single-location records or single "
+                "tower/basement records where the exact floor may be unspecified."
+            ),
+        ],
+        [
+            "Cross-floor & Unspecified",
+            (
+                "Contains all multi-location / cross-floor worker records. "
+                "Workers are retained once and are not automatically split."
+            ),
+        ],
+        [
+            "Exact multi-location",
+            (
+                "A worker explicitly listed at multiple exact locations is "
+                "counted once in the Cross-floor sheet."
+            ),
+        ],
+        [
+            "Tower only",
+            (
+                "A tower without a floor is shown in Location Detail as "
+                "floor unspecified and highlighted."
+            ),
+        ],
+        [
+            "Basement only",
+            (
+                "Basement without an exact floor is shown as floor "
+                "unspecified and highlighted."
+            ),
+        ],
+        [
+            "Podium / Basement",
+            (
+                "Kept in Cross-floor & distribution U because the exact "
+                "worker distribution is unknown."
+            ),
+        ],
+        [
+            "Project structure",
+            f"Towers: {towers_text}. Basement floors: {basement_text}.",
+        ],
+        [
+            "Highlighting",
+            (
+                "Pale yellow is used when the exact floor/location or "
+                "distribution is genuinely uncertain."
+            ),
+        ],
+    ]
+    for row in rule_rows:
+        rules.append(row)
+
+    set_master_header_style(rules, "A1:B1")
+    set_master_body_style(
+        rules,
+        f"A2:B{len(rule_rows) + 1}",
+    )
+    rules.column_dimensions["A"].width = 27
+    rules.column_dimensions["B"].width = 105
+    for row_number in range(2, len(rule_rows) + 2):
+        rules.cell(row_number, 2).alignment = Alignment(
+            vertical="top",
+            wrap_text=True,
+        )
+        rules.row_dimensions[row_number].height = 38
+    rules.freeze_panes = "A2"
+
+    # -----------------------------------------------------
+    # Daily Master
+    # -----------------------------------------------------
+    daily = workbook.create_sheet("Daily Master")
+    daily.append(
+        [
+            "Date",
+            "AC",
+            "EL",
+            "FS",
+            "PD",
+            "Daily Total",
+        ]
+    )
+    daily.append([None, None, None, None, None, "=SUM(B2:E2)"])
+    set_master_header_style(daily, "A1:F1")
+    set_master_body_style(daily, "A2:F2")
+    daily["A2"].number_format = "yyyy-mm-dd"
+    for column in "BCDEF":
+        daily[f"{column}2"].alignment = Alignment(
+            horizontal="center",
+            vertical="center",
+        )
+    add_master_table(
+        daily,
+        "A1:F2",
+        "DailyMasterTable",
+    )
+    daily.freeze_panes = "A2"
+    daily.column_dimensions["A"].width = 15
+    for column in "BCDE":
+        daily.column_dimensions[column].width = 11
+    daily.column_dimensions["F"].width = 15
+
+    # -----------------------------------------------------
+    # Location sheets
+    # -----------------------------------------------------
+    location_headers = [
+        "Date",
+        "Area / Tower",
+        "Location",
+        "AC",
+        "EL",
+        "FS",
+        "PD",
+        "Allocated Site Workers",
+        "Allocation Note",
+    ]
+
+    for (
+        sheet_name,
+        table_name,
+    ) in (
+        (
+            "Location Detail",
+            "LocationDetailTable",
+        ),
+        (
+            "Cross-F & distribution U",
+            "CrossFloorUnspecifiedTable",
+        ),
+    ):
+        worksheet = workbook.create_sheet(sheet_name)
+        worksheet.append(location_headers)
+        worksheet.append(
+            [
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "=SUM(D2:G2)",
+                None,
+            ]
+        )
+        set_master_header_style(worksheet, "A1:I1")
+        set_master_body_style(worksheet, "A2:I2")
+        worksheet["A2"].number_format = "yyyy-mm-dd"
+        for column in "DEFGH":
+            worksheet[f"{column}2"].alignment = Alignment(
+                horizontal="center",
+                vertical="center",
+            )
+        worksheet["C2"].alignment = Alignment(
+            vertical="center",
+            wrap_text=True,
+        )
+        worksheet["I2"].alignment = Alignment(
+            vertical="center",
+            wrap_text=True,
+        )
+        add_master_table(
+            worksheet,
+            "A1:I2",
+            table_name,
+        )
+        worksheet.freeze_panes = "A2"
+        widths = {
+            "A": 15,
+            "B": 30,
+            "C": 52,
+            "D": 9,
+            "E": 9,
+            "F": 9,
+            "G": 9,
+            "H": 22,
+            "I": 76,
+        }
+        for column, width in widths.items():
+            worksheet.column_dimensions[
+                column
+            ].width = width
+        worksheet.row_dimensions[2].height = 34
+
+    # -----------------------------------------------------
+    # Department Summary
+    # -----------------------------------------------------
+    department = workbook.create_sheet(
+        "Department Summary"
+    )
+    department.append(
+        ["Department", "Total Manpower"]
+    )
+    department_rows = [
+        ["AC", "=SUM('Daily Master'!B:B)"],
+        ["EL", "=SUM('Daily Master'!C:C)"],
+        ["FS", "=SUM('Daily Master'!D:D)"],
+        ["PD", "=SUM('Daily Master'!E:E)"],
+        ["Grand Total", "=SUM(B2:B5)"],
+    ]
+    for row in department_rows:
+        department.append(row)
+
+    set_master_header_style(department, "A1:B1")
+    set_master_body_style(department, "A2:B6")
+    for cell in department["B"]:
+        cell.alignment = Alignment(
+            horizontal="center",
+            vertical="center",
+        )
+    for column in "AB":
+        department[f"{column}6"].fill = PatternFill(
+            fill_type="solid",
+            fgColor=MASTER_LIGHT_BLUE_FILL,
+        )
+        department[f"{column}6"].font = Font(
+            name="Times New Roman",
+            size=12,
+            bold=True,
+            color=MASTER_DARK_BLUE_FONT,
+        )
+    department.column_dimensions["A"].width = 24
+    department.column_dimensions["B"].width = 20
+
+    # Put the workbook in a normal calculation state.
+    try:
+        workbook.calculation.fullCalcOnLoad = True
+        workbook.calculation.forceFullCalc = True
+        workbook.calculation.calcMode = "auto"
+    except Exception:
+        pass
+
+    output_buffer = io.BytesIO()
+    workbook.save(output_buffer)
+    return output_buffer.getvalue()
+
+
+
+
 EXCEL_REQUIRED_SHEETS = (
     "Overview",
     "Data Rules",
@@ -2943,6 +3450,399 @@ def export_updated_workbook(
     return output_buffer.getvalue(), preview
 
 
+
+
+
+
+# =========================================================
+# Manual location-review functions
+# =========================================================
+
+
+REVIEW_ACTIONS = (
+    "尚未處理",
+    "確認為單一位置",
+    "確認保留原始分布",
+)
+
+
+def numbered_floor_value(value: str) -> int:
+    match = re.search(r"(\d+)", clean_cell(value))
+    return int(match.group(1)) if match else -1
+
+
+def build_valid_location_options(
+    config: dict[str, Any],
+) -> list[str]:
+    """Build exact-location choices using the project configuration."""
+    options: list[str] = [""]
+
+    tower_floors = sorted(
+        config.get("tower_floors", []),
+        key=numbered_floor_value,
+        reverse=True,
+    )
+    for tower in config.get("towers", []):
+        for floor in tower_floors:
+            options.append(f"{tower} / {floor}")
+
+    podium_floors = list(
+        config.get("podium_floors", [])
+    )
+    podium_floors.sort(
+        key=lambda floor: (
+            floor.upper() == "GF",
+            -numbered_floor_value(floor),
+        )
+    )
+    for floor in podium_floors:
+        options.append(f"Podium / {floor}")
+
+    basement_floors = sorted(
+        config.get("basement_floors", []),
+        key=numbered_floor_value,
+    )
+    for floor in basement_floors:
+        options.append(f"Basement / {floor}")
+
+    for location in config.get(
+        "special_locations",
+        [],
+    ):
+        if location and location not in options:
+            options.append(location)
+
+    return options
+
+
+def derive_exact_location_fields(
+    standard_location: str,
+) -> tuple[str, str]:
+    """Derive Tower and Floor fields from a confirmed exact location."""
+    location = clean_cell(standard_location)
+
+    tower_match = re.fullmatch(
+        r"(T\d+)\s*/\s*(\d+F)",
+        location,
+        re.I,
+    )
+    if tower_match:
+        return (
+            tower_match.group(1).upper(),
+            tower_match.group(2).upper(),
+        )
+
+    podium_match = re.fullmatch(
+        r"Podium\s*/\s*(GF|\d+F)",
+        location,
+        re.I,
+    )
+    if podium_match:
+        return (
+            "",
+            podium_match.group(1).upper(),
+        )
+
+    basement_match = re.fullmatch(
+        r"Basement\s*/\s*(B\d+)",
+        location,
+        re.I,
+    )
+    if basement_match:
+        return (
+            "",
+            basement_match.group(1).upper(),
+        )
+
+    return "", location
+
+
+def apply_manual_review_overrides(
+    detail_df: pd.DataFrame,
+    overrides: dict[str, dict[str, Any]],
+) -> pd.DataFrame:
+    """Apply saved human-review decisions to the editable detail table."""
+    reviewed_df = detail_df.copy()
+
+    if "明細ID" not in reviewed_df.columns:
+        return reviewed_df
+
+    for row_index, row in reviewed_df.iterrows():
+        record_id = clean_cell(row.get("明細ID"))
+        override = overrides.get(record_id)
+
+        if not override:
+            continue
+
+        for column_name in (
+            "標準位置",
+            "樓座",
+            "樓層",
+            "位置狀態",
+            "人工備註",
+        ):
+            if column_name in override:
+                reviewed_df.at[
+                    row_index,
+                    column_name,
+                ] = override[column_name]
+
+    return reviewed_df
+
+
+# =========================================================
+# Validation and reconciliation functions
+# =========================================================
+
+
+def audit_number(value: Any) -> int | None:
+    """Convert a report value into an integer for validation."""
+    if value is None or value == "":
+        return None
+
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if pd.isna(numeric):
+        return None
+
+    return int(round(numeric))
+
+
+def build_validation_report(
+    summary_rows: list[dict[str, Any]],
+    edited_detail_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, int, int]:
+    """Validate every analysed report against its edited location details.
+
+    Hard blockers:
+    - analysis failed;
+    - date/trade/Worker missing;
+    - location-detail total does not equal Worker;
+    - Today Total Manpower is lower than Worker;
+    - more than one different report exists for the same date and trade.
+
+    Warnings:
+    - some manpower remains in Cross-floor, Distribution U or
+      unspecified locations.
+    """
+    audit_columns = [
+        "狀態",
+        "日期",
+        "工種",
+        "文件",
+        "Today Total",
+        "Worker",
+        "明細合計",
+        "差額",
+        "待確認人數",
+        "待確認列數",
+        "已確認保留人數",
+        "已確認保留列數",
+        "核對說明",
+    ]
+
+    if not summary_rows:
+        return (
+            pd.DataFrame(columns=audit_columns),
+            1,
+            0,
+        )
+
+    working_df = edited_detail_df.copy()
+
+    required_detail_columns = {
+        "文件": "",
+        "工種": "",
+        "人數": 0,
+        "位置狀態": "需人工確認位置",
+    }
+    for column_name, default_value in required_detail_columns.items():
+        if column_name not in working_df.columns:
+            working_df[column_name] = default_value
+
+    working_df["文件"] = (
+        working_df["文件"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    working_df["工種"] = (
+        working_df["工種"]
+        .fillna("")
+        .astype(str)
+        .str.upper()
+        .str.strip()
+    )
+    working_df["人數"] = pd.to_numeric(
+        working_df["人數"],
+        errors="coerce",
+    ).fillna(0)
+    working_df["位置狀態"] = (
+        working_df["位置狀態"]
+        .fillna("需人工確認位置")
+        .astype(str)
+        .str.strip()
+    )
+
+    date_trade_counts: dict[tuple[str, str], int] = {}
+    for summary in summary_rows:
+        date_text = clean_cell(summary.get("日期"))
+        trade = clean_cell(summary.get("工種")).upper()
+        if date_text and trade in REQUIRED_TRADES:
+            key = (date_text, trade)
+            date_trade_counts[key] = (
+                date_trade_counts.get(key, 0) + 1
+            )
+
+    audit_rows: list[dict[str, Any]] = []
+    blocker_count = 0
+    warning_count = 0
+
+    for summary in summary_rows:
+        filename = clean_cell(summary.get("文件"))
+        date_text = clean_cell(summary.get("日期"))
+        trade = clean_cell(summary.get("工種")).upper()
+        today_total = audit_number(
+            summary.get("Today Total Manpower")
+        )
+        worker = audit_number(summary.get("Worker"))
+
+        file_detail_df = working_df[
+            working_df["文件"] == filename
+        ].copy()
+
+        detail_total = int(
+            file_detail_df["人數"].sum()
+        ) if not file_detail_df.empty else 0
+
+        retained_mask = (
+            file_detail_df["位置狀態"]
+            == "已人工確認保留"
+        )
+        review_mask = ~file_detail_df[
+            "位置狀態"
+        ].isin(
+            {
+                "已解析",
+                "已人工確認保留",
+            }
+        )
+
+        review_people = int(
+            file_detail_df.loc[
+                review_mask,
+                "人數",
+            ].sum()
+        ) if not file_detail_df.empty else 0
+        review_rows = int(review_mask.sum())
+
+        retained_people = int(
+            file_detail_df.loc[
+                retained_mask,
+                "人數",
+            ].sum()
+        ) if not file_detail_df.empty else 0
+        retained_rows = int(retained_mask.sum())
+
+        reasons: list[str] = []
+        is_blocker = False
+
+        reconciliation_text = clean_cell(
+            summary.get("Worker核對")
+        )
+        extraction_method = clean_cell(
+            summary.get("明細提取方式")
+        )
+
+        if (
+            date_text in {"", "未讀取", "分析失敗"}
+            or extraction_method == "失敗"
+            or reconciliation_text.startswith("錯誤")
+        ):
+            reasons.append("報告分析失敗或日期未能讀取")
+            is_blocker = True
+
+        if trade not in REQUIRED_TRADES:
+            reasons.append("工種未能識別")
+            is_blocker = True
+
+        if worker is None:
+            reasons.append("未能讀取Worker")
+            is_blocker = True
+            difference: int | None = None
+        else:
+            difference = detail_total - worker
+            if difference != 0:
+                reasons.append(
+                    f"明細與Worker相差{difference:+d}"
+                )
+                is_blocker = True
+
+        if (
+            today_total is not None
+            and worker is not None
+            and today_total < worker
+        ):
+            reasons.append(
+                "Today Total Manpower低於Worker"
+            )
+            is_blocker = True
+
+        if date_trade_counts.get(
+            (date_text, trade),
+            0,
+        ) > 1:
+            reasons.append("同一日期及工種有多份不同報告")
+            is_blocker = True
+
+        if is_blocker:
+            status = "❌ 阻止匯出"
+            blocker_count += 1
+        elif review_people > 0:
+            status = "⚠️ 可匯出，仍待覆核"
+            warning_count += 1
+            reasons.append(
+                "人數已核對，但部分位置尚未完成人工覆核"
+            )
+        elif retained_people > 0:
+            status = "✅ 通過，已確認保留"
+            reasons.append(
+                "人工確認保留Cross-floor／Distribution U／"
+                "未指定位置，不作假設分配"
+            )
+        else:
+            status = "✅ 通過"
+            reasons.append("Worker及位置明細核對通過")
+
+        audit_rows.append(
+            {
+                "狀態": status,
+                "日期": date_text,
+                "工種": trade,
+                "文件": filename,
+                "Today Total": today_total,
+                "Worker": worker,
+                "明細合計": detail_total,
+                "差額": difference,
+                "待確認人數": review_people,
+                "待確認列數": review_rows,
+                "已確認保留人數": retained_people,
+                "已確認保留列數": retained_rows,
+                "核對說明": "；".join(reasons),
+            }
+        )
+
+    audit_df = pd.DataFrame(
+        audit_rows,
+        columns=audit_columns,
+    )
+
+    return audit_df, blocker_count, warning_count
+
+
 # =========================================================
 # Page title
 # =========================================================
@@ -3109,12 +4009,45 @@ if "project_config" in st.session_state:
         st.write(f"**有效 Tower 樓層：** {len(config['tower_floors'])} 層")
 
     config_json = json.dumps(config, ensure_ascii=False, indent=2)
-    st.download_button(
-        "下載工程設定 JSON",
-        data=config_json,
-        file_name="project_config.json",
-        mime="application/json",
-        width="stretch",
+    config_download_col, template_download_col = (
+        st.columns(2)
+    )
+
+    with config_download_col:
+        st.download_button(
+            "下載工程設定 JSON",
+            data=config_json,
+            file_name="project_config.json",
+            mime="application/json",
+            width="stretch",
+        )
+
+    with template_download_col:
+        blank_template_bytes = (
+            create_blank_master_template_bytes(
+                config
+            )
+        )
+        blank_project_filename = (
+            safe_filename_part(
+                config["project_name"]
+            )
+            + "_Manpower_Blank_Template.xlsx"
+        )
+        st.download_button(
+            "下載全新空白Excel模板",
+            data=blank_template_bytes,
+            file_name=blank_project_filename,
+            mime=(
+                "application/vnd.openxmlformats-"
+                "officedocument.spreadsheetml.sheet"
+            ),
+            width="stretch",
+        )
+
+    st.caption(
+        "空白模板保留六張工作表、深藍表頭、公式、"
+        "表格格式及黃色不確定位置規則，但不包含舊工程歷史資料。"
     )
 
 
@@ -3339,6 +4272,22 @@ else:
                     )
 
         st.session_state["analysis_results"] = results
+        st.session_state.pop(
+            "manual_review_overrides_v061",
+            None,
+        )
+        st.session_state.pop(
+            "validation_records_v061",
+            None,
+        )
+        st.session_state.pop(
+            "excel_export_bytes_v070",
+            None,
+        )
+        st.session_state.pop(
+            "excel_export_preview_v070",
+            None,
+        )
         st.success("AC／EL／FS／PD PDF 分析完成。")
 
 
@@ -3377,8 +4326,22 @@ if analysis_results:
 
     if all_detail_rows:
         detail_df = pd.DataFrame(all_detail_rows)
+        detail_df.insert(
+            0,
+            "明細ID",
+            [
+                f"R{index:04d}"
+                for index in range(
+                    1,
+                    len(detail_df) + 1,
+                )
+            ],
+        )
+        if "人工備註" not in detail_df.columns:
+            detail_df["人工備註"] = ""
 
         preferred_columns = [
+            "明細ID",
             "日期",
             "工種",
             "文件",
@@ -3392,6 +4355,7 @@ if analysis_results:
             "人數",
             "人數計算方法",
             "位置狀態",
+            "人工備註",
         ]
         detail_df = detail_df.reindex(columns=preferred_columns)
 
@@ -3401,6 +4365,7 @@ if analysis_results:
             hide_index=True,
             num_rows="dynamic",
             disabled=[
+                "明細ID",
                 "日期",
                 "工種",
                 "文件",
@@ -3413,14 +4378,356 @@ if analysis_results:
                 "人數計算方法",
             ],
             column_config={
+                "明細ID": None,
                 "人數": st.column_config.NumberColumn(
                     "人數",
                     min_value=0,
                     step=1,
                 )
             },
-            key="combined_detail_editor_v040",
+            key="combined_detail_editor_v061",
         )
+
+        # Fill IDs for any manually added rows.
+        for row_index in edited_detail_df.index:
+            if not clean_cell(
+                edited_detail_df.at[
+                    row_index,
+                    "明細ID",
+                ]
+            ):
+                edited_detail_df.at[
+                    row_index,
+                    "明細ID",
+                ] = f"M{int(row_index) + 1:04d}"
+
+        saved_overrides = st.session_state.get(
+            "manual_review_overrides_v061",
+            {},
+        )
+        edited_detail_df = (
+            apply_manual_review_overrides(
+                edited_detail_df,
+                saved_overrides,
+            )
+        )
+
+        # =================================================
+        # Section 6: Manual location review
+        # =================================================
+
+        st.divider()
+        st.subheader("6. 待確認位置處理")
+
+        unresolved_mask = ~edited_detail_df[
+            "位置狀態"
+        ].isin(
+            {
+                "已解析",
+                "已人工確認保留",
+            }
+        )
+        retained_mask = (
+            edited_detail_df["位置狀態"]
+            == "已人工確認保留"
+        )
+
+        review_metric1, review_metric2, review_metric3 = (
+            st.columns(3)
+        )
+        review_metric1.metric(
+            "尚未處理列數",
+            int(unresolved_mask.sum()),
+        )
+        review_metric2.metric(
+            "尚未處理人數",
+            int(
+                pd.to_numeric(
+                    edited_detail_df.loc[
+                        unresolved_mask,
+                        "人數",
+                    ],
+                    errors="coerce",
+                ).fillna(0).sum()
+            ),
+        )
+        review_metric3.metric(
+            "已確認保留列數",
+            int(retained_mask.sum()),
+        )
+
+        reviewable_mask = (
+            edited_detail_df["位置狀態"]
+            != "已解析"
+        )
+        review_source_df = edited_detail_df.loc[
+            reviewable_mask
+        ].copy()
+
+        if review_source_df.empty:
+            st.success(
+                "沒有Cross-floor、Distribution U或"
+                "未指定位置需要處理。"
+            )
+        else:
+            st.info(
+                "知道實際單一位置時，選「確認為單一位置」；"
+                "報告本身沒有提供分布時，選"
+                "「確認保留原始分布」。後者仍會放入"
+                "Cross-F／Distribution U，不會被系統亂分配。"
+            )
+
+            valid_location_options = (
+                build_valid_location_options(
+                    st.session_state[
+                        "project_config"
+                    ]
+                )
+            )
+
+            review_rows: list[dict[str, Any]] = []
+            for _, review_row in review_source_df.iterrows():
+                record_id = clean_cell(
+                    review_row.get("明細ID")
+                )
+                saved_override = saved_overrides.get(
+                    record_id,
+                    {},
+                )
+                current_status = clean_cell(
+                    review_row.get("位置狀態")
+                )
+
+                if current_status == "已人工確認保留":
+                    default_action = (
+                        "確認保留原始分布"
+                    )
+                elif (
+                    current_status == "已解析"
+                    and clean_cell(
+                        review_row.get("標準位置")
+                    )
+                    in valid_location_options
+                ):
+                    default_action = (
+                        "確認為單一位置"
+                    )
+                else:
+                    default_action = "尚未處理"
+
+                review_rows.append(
+                    {
+                        "明細ID": record_id,
+                        "日期": review_row.get("日期", ""),
+                        "工種": review_row.get("工種", ""),
+                        "文件": review_row.get("文件", ""),
+                        "工作描述／工人": (
+                            clean_cell(
+                                review_row.get(
+                                    "工作描述"
+                                )
+                            )
+                            or clean_cell(
+                                review_row.get(
+                                    "工人姓名"
+                                )
+                            )
+                        ),
+                        "原始位置": review_row.get(
+                            "原始位置",
+                            "",
+                        ),
+                        "人數": review_row.get("人數", 0),
+                        "目前標準位置": review_row.get(
+                            "標準位置",
+                            "",
+                        ),
+                        "目前狀態": current_status,
+                        "處理方式": saved_override.get(
+                            "處理方式",
+                            default_action,
+                        ),
+                        "確認為位置": saved_override.get(
+                            "確認為位置",
+                            (
+                                review_row.get(
+                                    "標準位置",
+                                    "",
+                                )
+                                if review_row.get(
+                                    "標準位置",
+                                    "",
+                                )
+                                in valid_location_options
+                                else ""
+                            ),
+                        ),
+                        "人工備註": saved_override.get(
+                            "人工備註",
+                            review_row.get(
+                                "人工備註",
+                                "",
+                            ),
+                        ),
+                    }
+                )
+
+            review_editor_df = st.data_editor(
+                pd.DataFrame(review_rows),
+                width="stretch",
+                hide_index=True,
+                disabled=[
+                    "明細ID",
+                    "日期",
+                    "工種",
+                    "文件",
+                    "工作描述／工人",
+                    "原始位置",
+                    "人數",
+                    "目前標準位置",
+                    "目前狀態",
+                ],
+                column_config={
+                    "明細ID": None,
+                    "處理方式": (
+                        st.column_config.SelectboxColumn(
+                            "處理方式",
+                            options=list(REVIEW_ACTIONS),
+                            required=True,
+                        )
+                    ),
+                    "確認為位置": (
+                        st.column_config.SelectboxColumn(
+                            "確認為位置",
+                            options=valid_location_options,
+                        )
+                    ),
+                },
+                key="manual_review_editor_v061",
+            )
+
+            apply_col, clear_col = st.columns(2)
+
+            with apply_col:
+                apply_review = st.button(
+                    "套用人工確認",
+                    type="primary",
+                    width="stretch",
+                )
+
+            with clear_col:
+                clear_review = st.button(
+                    "清除全部人工確認",
+                    width="stretch",
+                )
+
+            if clear_review:
+                st.session_state.pop(
+                    "manual_review_overrides_v061",
+                    None,
+                )
+                st.rerun()
+
+            if apply_review:
+                new_overrides = dict(saved_overrides)
+                review_errors: list[str] = []
+
+                for _, reviewed_row in (
+                    review_editor_df.iterrows()
+                ):
+                    record_id = clean_cell(
+                        reviewed_row.get("明細ID")
+                    )
+                    action = clean_cell(
+                        reviewed_row.get("處理方式")
+                    )
+                    selected_location = clean_cell(
+                        reviewed_row.get(
+                            "確認為位置"
+                        )
+                    )
+                    manual_note = clean_cell(
+                        reviewed_row.get("人工備註")
+                    )
+
+                    if action == "尚未處理":
+                        new_overrides.pop(
+                            record_id,
+                            None,
+                        )
+                        continue
+
+                    if action == "確認為單一位置":
+                        if not selected_location:
+                            review_errors.append(
+                                f"{record_id}：請選擇確認位置"
+                            )
+                            continue
+
+                        tower_value, floor_value = (
+                            derive_exact_location_fields(
+                                selected_location
+                            )
+                        )
+                        new_overrides[record_id] = {
+                            "處理方式": action,
+                            "確認為位置": (
+                                selected_location
+                            ),
+                            "標準位置": (
+                                selected_location
+                            ),
+                            "樓座": tower_value,
+                            "樓層": floor_value,
+                            "位置狀態": "已解析",
+                            "人工備註": manual_note,
+                        }
+                        continue
+
+                    if action == "確認保留原始分布":
+                        new_overrides[record_id] = {
+                            "處理方式": action,
+                            "確認為位置": "",
+                            "標準位置": clean_cell(
+                                reviewed_row.get(
+                                    "目前標準位置"
+                                )
+                            ),
+                            "樓座": clean_cell(
+                                review_source_df.loc[
+                                    review_source_df[
+                                        "明細ID"
+                                    ]
+                                    == record_id,
+                                    "樓座",
+                                ].iloc[0]
+                            ),
+                            "樓層": clean_cell(
+                                review_source_df.loc[
+                                    review_source_df[
+                                        "明細ID"
+                                    ]
+                                    == record_id,
+                                    "樓層",
+                                ].iloc[0]
+                            ),
+                            "位置狀態": (
+                                "已人工確認保留"
+                            ),
+                            "人工備註": manual_note,
+                        }
+
+                if review_errors:
+                    st.error(
+                        "未能套用："
+                        + "；".join(review_errors)
+                    )
+                else:
+                    st.session_state[
+                        "manual_review_overrides_v061"
+                    ] = new_overrides
+                    st.success("人工確認已套用。")
+                    st.rerun()
 
         col1, col2 = st.columns(2)
         with col1:
@@ -3445,11 +4752,87 @@ if analysis_results:
         )
 
         # =================================================
-        # Section 6: Merge same-date and same-location data
+        # Section 7: Validation centre
         # =================================================
 
         st.divider()
-        st.subheader("6. 跨工種位置合併")
+        st.subheader("7. 資料核對中心")
+
+        (
+            audit_df,
+            audit_blocker_count,
+            audit_warning_count,
+        ) = build_validation_report(
+            summary_rows,
+            edited_detail_df,
+        )
+
+        st.session_state[
+            "validation_records_v061"
+        ] = audit_df.to_dict("records")
+        st.session_state[
+            "validation_blockers_v061"
+        ] = audit_blocker_count
+        st.session_state[
+            "validation_warnings_v061"
+        ] = audit_warning_count
+
+        audit_metric1, audit_metric2, audit_metric3 = (
+            st.columns(3)
+        )
+        audit_metric1.metric(
+            "分析報告",
+            len(audit_df),
+        )
+        audit_metric2.metric(
+            "阻止匯出",
+            audit_blocker_count,
+        )
+        audit_metric3.metric(
+            "尚未完成覆核",
+            audit_warning_count,
+        )
+
+        st.dataframe(
+            audit_df,
+            width="stretch",
+            hide_index=True,
+        )
+
+        st.download_button(
+            "下載資料核對報告 CSV",
+            data=audit_df.to_csv(
+                index=False
+            ).encode("utf-8-sig"),
+            file_name="manpower_validation_report.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+
+        if audit_blocker_count > 0:
+            st.error(
+                "存在人數差額、分析失敗、缺少Worker，"
+                "或同一日期工種重複。"
+                "修正前Excel匯出會被停用。"
+            )
+        elif audit_warning_count > 0:
+            st.warning(
+                "所有Worker人數均已核對一致，"
+                "但仍有位置尚未完成人工覆核。"
+                "請到上方「待確認位置處理」選擇"
+                "確認單一位置或確認保留原始分布。"
+            )
+        else:
+            st.success(
+                "所有報告的人數及位置明細均通過核對。"
+            )
+
+        # =================================================
+        # Section 8: Merge same-date and same-location data
+        # =================================================
+
+        st.divider()
+        st.subheader("8. 跨工種位置合併")
 
         confirmed_summary_df, review_summary_df = (
             build_location_summary(edited_detail_df)
@@ -3523,11 +4906,11 @@ if analysis_results:
             st.text(result["raw_text"] or "沒有提取到文字。")
 
 # =========================================================
-# Section 7: Excel template update and export
+# Section 9: Excel workbook export
 # =========================================================
 
 st.divider()
-st.subheader("7. 更新原有Excel工作簿")
+st.subheader("9. Excel工作簿輸出")
 
 if not analysis_results:
     st.info("請先完成PDF分析，才可以更新Excel。")
@@ -3540,40 +4923,135 @@ else:
         "review_summary_records",
         [],
     )
-
-    st.write(
-        "上傳你原有的Manpower Excel模板。"
-        "系統只會建立一份新的下載檔案，不會改動原始檔。"
+    audit_blocker_count = st.session_state.get(
+        "validation_blockers_v061",
+        1,
+    )
+    audit_warning_count = st.session_state.get(
+        "validation_warnings_v061",
+        0,
     )
 
-    excel_template_file = st.file_uploader(
-        "上傳Excel模板（.xlsx）",
-        type=["xlsx"],
-        accept_multiple_files=False,
-        key="excel_template_uploader_v052",
+    if audit_blocker_count > 0:
+        st.error(
+            "資料核對中心仍有阻止匯出的錯誤。"
+            "請先修正人數或報告問題。"
+        )
+    elif audit_warning_count > 0:
+        st.warning(
+            "仍有位置尚未完成人工覆核。"
+            "雖然不阻止匯出，建議先在"
+            "「待確認位置處理」完成決定。"
+        )
+    else:
+        st.success("資料核對已通過，可以建立Excel。")
+
+    export_mode = st.radio(
+        "選擇Excel輸出模式",
+        options=[
+            "更新現有工程Excel",
+            "建立全新工程Excel",
+        ],
+        horizontal=True,
+        key="excel_export_mode_v070",
     )
 
-    if excel_template_file is not None:
+    template_bytes_for_export: bytes | None = None
+    template_name_for_export = ""
+
+    if export_mode == "更新現有工程Excel":
+        st.write(
+            "上傳正在使用的Manpower Excel。"
+            "系統只會產生一份新副本，不會改動原始檔。"
+        )
+
+        excel_template_file = st.file_uploader(
+            "上傳現有Excel（.xlsx）",
+            type=["xlsx"],
+            accept_multiple_files=False,
+            key="excel_template_uploader_v070",
+        )
+
+        if excel_template_file is not None:
+            template_bytes_for_export = (
+                excel_template_file.getvalue()
+            )
+            template_name_for_export = (
+                excel_template_file.name
+            )
+            st.success(
+                f"已讀取現有Excel："
+                f"{excel_template_file.name}"
+            )
+            st.caption(
+                "同一日期只更新本次已分析的工種；"
+                "其他工種及較早日期保持原樣。"
+            )
+
+    else:
+        project_config_for_excel = (
+            st.session_state["project_config"]
+        )
+        template_bytes_for_export = (
+            create_blank_master_template_bytes(
+                project_config_for_excel
+            )
+        )
+        template_name_for_export = (
+            safe_filename_part(
+                project_config_for_excel[
+                    "project_name"
+                ]
+            )
+            + "_Manpower.xlsx"
+        )
+
         st.success(
-            f"已讀取模板：{excel_template_file.name}"
+            "將使用內置空白Master Template建立新工程Excel。"
         )
-
         st.caption(
-            "更新規則：Daily Master使用Today Total Manpower；"
-            "同一日期只更新本次已分析的工種，其他工種保持原樣；"
-            "只會重建本次更新日期的資料；較早日期的排列、內容及格式保持原樣。"
+            "新檔不包含舊工程歷史資料，"
+            "但保留六張工作表、公式、深藍表頭、"
+            "藍色間隔列及黃色不確定位置格式。"
         )
 
+        st.download_button(
+            "下載空白Master Template",
+            data=template_bytes_for_export,
+            file_name=(
+                safe_filename_part(
+                    project_config_for_excel[
+                        "project_name"
+                    ]
+                )
+                + "_Manpower_Blank_Template.xlsx"
+            ),
+            mime=(
+                "application/vnd.openxmlformats-"
+                "officedocument.spreadsheetml.sheet"
+            ),
+            width="stretch",
+        )
+
+    preview_button_text = (
+        "建立現有Excel更新預覽"
+        if export_mode
+        == "更新現有工程Excel"
+        else "建立全新工程Excel預覽"
+    )
+
+    if template_bytes_for_export is not None:
         if st.button(
-            "建立Excel更新預覽",
+            preview_button_text,
             type="primary",
             width="stretch",
+            disabled=(audit_blocker_count > 0),
         ):
             try:
                 export_bytes, export_preview = (
                     export_updated_workbook(
                         template_bytes=(
-                            excel_template_file.getvalue()
+                            template_bytes_for_export
                         ),
                         summary_rows=summary_rows,
                         confirmed_records=(
@@ -3584,36 +5062,39 @@ else:
                 )
 
                 st.session_state[
-                    "excel_export_bytes_v052"
+                    "excel_export_bytes_v070"
                 ] = export_bytes
                 st.session_state[
-                    "excel_export_preview_v052"
+                    "excel_export_preview_v070"
                 ] = export_preview
                 st.session_state[
-                    "excel_export_template_name_v052"
-                ] = excel_template_file.name
+                    "excel_export_template_name_v070"
+                ] = template_name_for_export
+                st.session_state[
+                    "excel_export_mode_saved_v070"
+                ] = export_mode
 
                 st.success(
-                    "Excel更新預覽已建立。"
+                    "Excel預覽已建立。"
                 )
 
             except Exception as error:
                 st.session_state.pop(
-                    "excel_export_bytes_v052",
+                    "excel_export_bytes_v070",
                     None,
                 )
                 st.session_state.pop(
-                    "excel_export_preview_v052",
+                    "excel_export_preview_v070",
                     None,
                 )
                 st.error("建立Excel時發生錯誤。")
                 st.exception(error)
 
     export_bytes = st.session_state.get(
-        "excel_export_bytes_v052"
+        "excel_export_bytes_v070"
     )
     export_preview = st.session_state.get(
-        "excel_export_preview_v052"
+        "excel_export_preview_v070"
     )
 
     if export_bytes and export_preview:
@@ -3666,20 +5147,33 @@ else:
         ).replace("-", "")
 
         original_template_name = st.session_state.get(
-            "excel_export_template_name_v052",
+            "excel_export_template_name_v070",
             "Manpower.xlsx",
         )
         original_stem = Path(
             original_template_name
         ).stem
 
-        output_filename = (
-            f"{original_stem}_updated_"
-            f"{latest_date_text}.xlsx"
+        saved_export_mode = st.session_state.get(
+            "excel_export_mode_saved_v070",
+            "更新現有工程Excel",
         )
 
+        if saved_export_mode == "建立全新工程Excel":
+            output_filename = (
+                f"{original_stem}_"
+                f"{latest_date_text}.xlsx"
+            )
+            download_label = "下載全新工程Excel"
+        else:
+            output_filename = (
+                f"{original_stem}_updated_"
+                f"{latest_date_text}.xlsx"
+            )
+            download_label = "下載更新後Excel"
+
         st.download_button(
-            "下載更新後Excel",
+            download_label,
             data=export_bytes,
             file_name=output_filename,
             mime=(
@@ -3691,6 +5185,7 @@ else:
         )
 
         st.warning(
-            "下載後先在Excel中檢查今日資料。"
-            "原始模板不會被覆蓋。"
+            "下載後先在Excel中檢查資料。"
+            "更新模式不會覆蓋原始檔；"
+            "新工程模式不會包含舊工程歷史資料。"
         )
