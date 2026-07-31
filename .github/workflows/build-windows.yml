@@ -1,0 +1,55 @@
+name: Build Windows Desktop App
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "desktop-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Build Windows application
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install application and build dependencies
+        run: python -m pip install -r requirements-desktop.txt
+
+      - name: Build desktop application
+        run: >
+          python -m PyInstaller
+          --noconfirm
+          --clean
+          Manpower_Report_Agent.spec
+
+      - name: Create distributable ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path "dist\Manpower Report Agent\*" `
+            -DestinationPath `
+              "dist\Manpower-Report-Agent-Windows.zip" `
+            -Force
+
+      - name: Upload Windows application
+        uses: actions/upload-artifact@v4
+        with:
+          name: Manpower-Report-Agent-Windows
+          path: dist/Manpower-Report-Agent-Windows.zip
+          if-no-files-found: error
+          retention-days: 30
