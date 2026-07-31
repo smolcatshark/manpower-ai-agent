@@ -11,6 +11,13 @@ import pandas as pd
 import pdfplumber
 import streamlit as st
 from openpyxl import Workbook, load_workbook
+from openpyxl.chart import BarChart, Reference
+from openpyxl.chart.shapes import GraphicalProperties
+from openpyxl.drawing.line import LineProperties
+from openpyxl.drawing.spreadsheet_drawing import (
+    AnchorMarker,
+    TwoCellAnchor,
+)
 from openpyxl.styles import (
     Alignment,
     Border,
@@ -29,7 +36,7 @@ st.set_page_config(
 )
 
 REQUIRED_TRADES = ("AC", "EL", "FS", "PD")
-APP_VERSION = "0.7.2 — Worker location fix"
+APP_VERSION = "0.7.4 — Overview chart layout fix"
 PARSER_MODE_OPTIONS = {
     "自動偵測": "auto",
     "Location＋Manpower數字欄": "numeric_table",
@@ -538,30 +545,56 @@ def parse_description_manpower(description: str) -> tuple[int | None, str]:
 
 
 def extract_towers(text: str) -> list[str]:
-    normalized = text.upper().replace("Ｔ", "T")
+    """Extract tower references written as T1, Tower 1, 1座 or lists."""
+    normalized = (
+        text.upper()
+        .replace("Ｔ", "T")
+        .replace("，", ",")
+        .replace("、", ",")
+        .replace("＆", "&")
+    )
     tower_numbers: set[int] = set()
 
     for group in re.findall(
-        r"((?:\d+\s*[,，/&、]\s*)+\d+)\s*座",
+        r"((?:\d+\s*[,/&+]\s*)+\d+)\s*座",
         normalized,
     ):
         for number in re.findall(r"\d+", group):
             tower_numbers.add(int(number))
 
     for group in re.findall(
-        r"T\s*(\d+(?:\s*[,/&、]\s*\d+)+)",
+        r"T\s*(\d+(?:\s*[,/&+]\s*\d+)+)",
         normalized,
     ):
         for number in re.findall(r"\d+", group):
             tower_numbers.add(int(number))
 
-    for number in re.findall(r"(?<!\d)(\d+)\s*座", normalized):
+    # Worker tables often spell towers out, for example:
+    # "Tower 1", "Tower 2/3" or "Towers 1, 2, 3".
+    for group in re.findall(
+        r"\bTOWERS?\s*"
+        r"(\d+(?:\s*[,/&+]\s*\d+)*)",
+        normalized,
+    ):
+        for number in re.findall(r"\d+", group):
+            tower_numbers.add(int(number))
+
+    for number in re.findall(
+        r"(?<!\d)(\d+)\s*座",
+        normalized,
+    ):
         tower_numbers.add(int(number))
 
-    for number in re.findall(r"\bT\s*(\d+)\b", normalized):
+    for number in re.findall(
+        r"\bT\s*(\d+)\b",
+        normalized,
+    ):
         tower_numbers.add(int(number))
 
-    return [f"T{number}" for number in sorted(tower_numbers)]
+    return [
+        f"T{number}"
+        for number in sorted(tower_numbers)
+    ]
 
 
 def normalize_report_location(value: str) -> str:
@@ -1889,6 +1922,53 @@ def set_master_body_style(
             )
 
 
+def apply_daily_master_banding(
+    worksheet: Any,
+) -> None:
+    """Apply visible alternating blue rows without relying on table themes.
+
+    Explicit cell fills are used because some spreadsheet viewers do not
+    render Excel table-style banding consistently.
+    """
+    last_data_row = 1
+
+    for row_number in range(
+        worksheet.max_row,
+        1,
+        -1,
+    ):
+        if parse_date_value(
+            worksheet.cell(row_number, 1).value
+        ) is not None:
+            last_data_row = row_number
+            break
+
+    if last_data_row < 2:
+        return
+
+    blue_fill = PatternFill(
+        fill_type="solid",
+        fgColor=MASTER_LIGHT_BLUE_FILL,
+    )
+    white_fill = PatternFill(
+        fill_type="solid",
+        fgColor="FFFFFF",
+    )
+
+    for row_number in range(2, last_data_row + 1):
+        row_fill = (
+            blue_fill
+            if row_number % 2 == 0
+            else white_fill
+        )
+
+        for column_number in range(1, 7):
+            worksheet.cell(
+                row_number,
+                column_number,
+            ).fill = copy(row_fill)
+
+
 def add_master_table(
     worksheet: Any,
     reference: str,
@@ -1912,7 +1992,7 @@ def add_master_table(
 def create_blank_master_template_bytes(
     config: dict[str, Any],
 ) -> bytes:
-    """Create a completely new blank workbook in the current master layout."""
+    """Create a new blank workbook matching the established master style."""
     workbook = Workbook()
     default_sheet = workbook.active
     workbook.remove(default_sheet)
@@ -1925,8 +2005,10 @@ def create_blank_master_template_bytes(
     # Overview
     # -----------------------------------------------------
     overview = workbook.create_sheet("Overview")
-    overview.merge_cells("A1:D1")
-    overview["A1"] = f"{project_name} Manpower Overview"
+    overview.merge_cells("A1:H2")
+    overview["A1"] = (
+        f"{project_name} Manpower Overview"
+    )
     overview["A1"].fill = PatternFill(
         fill_type="solid",
         fgColor=MASTER_HEADER_FILL,
@@ -1938,81 +2020,133 @@ def create_blank_master_template_bytes(
         color=MASTER_HEADER_FONT,
     )
     overview["A1"].alignment = Alignment(
-        horizontal="center",
+        horizontal="left",
         vertical="center",
     )
-    overview.row_dimensions[1].height = 28
+    overview.row_dimensions[1].height = 24
+    overview.row_dimensions[2].height = 8
 
     overview["A4"] = "Metric"
     overview["B4"] = "Value"
-    overview["D4"] = "How to use the location analysis"
-    set_master_header_style(overview, "A4:B4")
-    set_master_header_style(overview, "D4:D4")
+    overview.merge_cells("D4:H4")
+    overview["D4"] = (
+        "How to use the location analysis"
+    )
+    set_master_header_style(
+        overview,
+        "A4:B4",
+    )
+    set_master_header_style(
+        overview,
+        "D4:H4",
+    )
 
     overview_rows = [
         (
             "Start Date",
-            '=IFERROR(MIN(\'Daily Master\'!A:A),"")',
+            '=IF(COUNT(\'Daily Master\'!A:A)=0,"",MIN(\'Daily Master\'!A:A))',
         ),
         (
             "Last Updated",
-            '=IFERROR(MAX(\'Daily Master\'!A:A),"")',
+            '=IF(COUNT(\'Daily Master\'!A:A)=0,"",MAX(\'Daily Master\'!A:A))',
         ),
         (
             "Total Manpower",
             "='Department Summary'!B6",
         ),
-        ("AC", "='Department Summary'!B2"),
-        ("EL", "='Department Summary'!B3"),
-        ("FS", "='Department Summary'!B4"),
-        ("PD", "='Department Summary'!B5"),
+        (
+            "AC",
+            "='Department Summary'!B2",
+        ),
+        (
+            "EL",
+            "='Department Summary'!B3",
+        ),
+        (
+            "FS",
+            "='Department Summary'!B4",
+        ),
+        (
+            "PD",
+            "='Department Summary'!B5",
+        ),
         (
             "Days with Reports",
             '=COUNT(\'Daily Master\'!A:A)',
         ),
     ]
+
     for row_number, (metric, formula) in enumerate(
         overview_rows,
         start=5,
     ):
-        overview.cell(row_number, 1).value = metric
-        overview.cell(row_number, 2).value = formula
+        overview.cell(
+            row_number,
+            1,
+        ).value = metric
+        overview.cell(
+            row_number,
+            2,
+        ).value = formula
 
+    set_master_body_style(
+        overview,
+        "A5:B12",
+    )
+
+    overview_label_fill = PatternFill(
+        fill_type="solid",
+        fgColor=MASTER_LIGHT_BLUE_FILL,
+    )
+    overview_label_font = Font(
+        name="Times New Roman",
+        size=12,
+        bold=True,
+        color=MASTER_DARK_BLUE_FONT,
+    )
+
+    for row_number in range(5, 13):
+        overview.cell(
+            row_number,
+            1,
+        ).fill = copy(overview_label_fill)
+        overview.cell(
+            row_number,
+            1,
+        ).font = copy(overview_label_font)
+
+    overview.merge_cells("D5:H12")
     overview["D5"] = (
         "Use “Location Detail” to filter by date, trade, tower or "
         "work location. Cross-floor and multi-location records are "
         "kept once in “Cross-F & distribution U” when the reports do "
         "not state the exact worker distribution."
     )
-    overview.merge_cells("D5:D12")
-
-    set_master_body_style(overview, "A5:B12")
-    set_master_body_style(overview, "D5:D12")
+    set_master_body_style(
+        overview,
+        "D5:H12",
+    )
+    overview["D5"].fill = PatternFill(
+        fill_type="solid",
+        fgColor="EAF2F8",
+    )
     overview["D5"].alignment = Alignment(
-        vertical="top",
+        vertical="center",
         wrap_text=True,
     )
+
     overview["B5"].number_format = "yyyy-mm-dd"
     overview["B6"].number_format = "yyyy-mm-dd"
-    overview["A12"].fill = PatternFill(
-        fill_type="solid",
-        fgColor=MASTER_LIGHT_BLUE_FILL,
-    )
-    overview["B12"].fill = PatternFill(
-        fill_type="solid",
-        fgColor=MASTER_LIGHT_BLUE_FILL,
-    )
-    overview["A12"].font = Font(
-        name="Times New Roman",
-        size=12,
-        bold=True,
-        color=MASTER_DARK_BLUE_FONT,
-    )
-    overview["B12"].font = copy(overview["A12"].font)
+
     overview.column_dimensions["A"].width = 23
     overview.column_dimensions["B"].width = 18
-    overview.column_dimensions["C"].width = 3
-    overview.column_dimensions["D"].width = 58
+    overview.column_dimensions["C"].width = 4
+
+    for column in "DEFGH":
+        overview.column_dimensions[
+            column
+        ].width = 18
+
     overview.freeze_panes = "A4"
 
     # -----------------------------------------------------
@@ -2044,14 +2178,15 @@ def create_blank_master_template_bytes(
         [
             "Main Location Detail",
             (
-                "Contains only single-location records or single "
-                "tower/basement records where the exact floor may be unspecified."
+                "Contains only single-location records or a single "
+                "tower/basement/podium record where the exact floor may "
+                "be unspecified."
             ),
         ],
         [
             "Cross-floor & Unspecified",
             (
-                "Contains all multi-location / cross-floor worker records. "
+                "Contains multi-location or cross-floor worker records. "
                 "Workers are retained once and are not automatically split."
             ),
         ],
@@ -2065,8 +2200,15 @@ def create_blank_master_template_bytes(
         [
             "Tower only",
             (
-                "A tower without a floor is shown in Location Detail as "
-                "floor unspecified and highlighted."
+                "A single tower without a floor is shown in Location "
+                "Detail as T1/T2/T3 (floor unspecified) and highlighted."
+            ),
+        ],
+        [
+            "Floor only",
+            (
+                "A floor without an exact tower remains in Location Detail "
+                "under Tower (unspecified) and is highlighted."
             ),
         ],
         [
@@ -2079,13 +2221,16 @@ def create_blank_master_template_bytes(
         [
             "Podium / Basement",
             (
-                "Kept in Cross-floor & distribution U because the exact "
-                "worker distribution is unknown."
+                "A combined Podium and Basement reference remains in "
+                "Cross-F & distribution U because distribution is unknown."
             ),
         ],
         [
             "Project structure",
-            f"Towers: {towers_text}. Basement floors: {basement_text}.",
+            (
+                f"Towers: {towers_text}. "
+                f"Basement floors: {basement_text}."
+            ),
         ],
         [
             "Highlighting",
@@ -2095,22 +2240,44 @@ def create_blank_master_template_bytes(
             ),
         ],
     ]
+
     for row in rule_rows:
         rules.append(row)
 
-    set_master_header_style(rules, "A1:B1")
+    last_rule_row = len(rule_rows) + 1
+
+    set_master_header_style(
+        rules,
+        "A1:B1",
+    )
     set_master_body_style(
         rules,
-        f"A2:B{len(rule_rows) + 1}",
+        f"A2:B{last_rule_row}",
     )
-    rules.column_dimensions["A"].width = 27
-    rules.column_dimensions["B"].width = 105
-    for row_number in range(2, len(rule_rows) + 2):
-        rules.cell(row_number, 2).alignment = Alignment(
-            vertical="top",
+
+    rule_label_fill = PatternFill(
+        fill_type="solid",
+        fgColor="C6EAF8",
+    )
+
+    for row_number in range(2, last_rule_row + 1):
+        rules.cell(
+            row_number,
+            1,
+        ).fill = copy(rule_label_fill)
+        rules.cell(
+            row_number,
+            2,
+        ).alignment = Alignment(
+            vertical="center",
             wrap_text=True,
         )
-        rules.row_dimensions[row_number].height = 38
+        rules.row_dimensions[
+            row_number
+        ].height = 42
+
+    rules.column_dimensions["A"].width = 29
+    rules.column_dimensions["B"].width = 105
     rules.freeze_panes = "A2"
 
     # -----------------------------------------------------
@@ -2127,15 +2294,41 @@ def create_blank_master_template_bytes(
             "Daily Total",
         ]
     )
-    daily.append([None, None, None, None, None, "=SUM(B2:E2)"])
-    set_master_header_style(daily, "A1:F1")
-    set_master_body_style(daily, "A2:F2")
+    daily.append(
+        [
+            None,
+            None,
+            None,
+            None,
+            None,
+            "=SUM(B2:E2)",
+        ]
+    )
+    set_master_header_style(
+        daily,
+        "A1:F1",
+    )
+    set_master_body_style(
+        daily,
+        "A2:F2",
+    )
     daily["A2"].number_format = "yyyy-mm-dd"
+
     for column in "BCDEF":
-        daily[f"{column}2"].alignment = Alignment(
+        daily[
+            f"{column}2"
+        ].alignment = Alignment(
             horizontal="center",
             vertical="center",
         )
+
+    daily_row_fill = PatternFill(
+        fill_type="solid",
+        fgColor=MASTER_LIGHT_BLUE_FILL,
+    )
+    for cell in daily[2]:
+        cell.fill = copy(daily_row_fill)
+
     add_master_table(
         daily,
         "A1:F2",
@@ -2143,8 +2336,12 @@ def create_blank_master_template_bytes(
     )
     daily.freeze_panes = "A2"
     daily.column_dimensions["A"].width = 15
+
     for column in "BCDE":
-        daily.column_dimensions[column].width = 11
+        daily.column_dimensions[
+            column
+        ].width = 11
+
     daily.column_dimensions["F"].width = 15
 
     # -----------------------------------------------------
@@ -2162,10 +2359,7 @@ def create_blank_master_template_bytes(
         "Allocation Note",
     ]
 
-    for (
-        sheet_name,
-        table_name,
-    ) in (
+    for sheet_name, table_name in (
         (
             "Location Detail",
             "LocationDetailTable",
@@ -2175,7 +2369,9 @@ def create_blank_master_template_bytes(
             "CrossFloorUnspecifiedTable",
         ),
     ):
-        worksheet = workbook.create_sheet(sheet_name)
+        worksheet = workbook.create_sheet(
+            sheet_name
+        )
         worksheet.append(location_headers)
         worksheet.append(
             [
@@ -2190,14 +2386,26 @@ def create_blank_master_template_bytes(
                 None,
             ]
         )
-        set_master_header_style(worksheet, "A1:I1")
-        set_master_body_style(worksheet, "A2:I2")
-        worksheet["A2"].number_format = "yyyy-mm-dd"
+        set_master_header_style(
+            worksheet,
+            "A1:I1",
+        )
+        set_master_body_style(
+            worksheet,
+            "A2:I2",
+        )
+        worksheet["A2"].number_format = (
+            "yyyy-mm-dd"
+        )
+
         for column in "DEFGH":
-            worksheet[f"{column}2"].alignment = Alignment(
+            worksheet[
+                f"{column}2"
+            ].alignment = Alignment(
                 horizontal="center",
                 vertical="center",
             )
+
         worksheet["C2"].alignment = Alignment(
             vertical="center",
             wrap_text=True,
@@ -2206,12 +2414,14 @@ def create_blank_master_template_bytes(
             vertical="center",
             wrap_text=True,
         )
+
         add_master_table(
             worksheet,
             "A1:I2",
             table_name,
         )
         worksheet.freeze_panes = "A2"
+
         widths = {
             "A": 15,
             "B": 30,
@@ -2223,10 +2433,12 @@ def create_blank_master_template_bytes(
             "H": 22,
             "I": 76,
         }
+
         for column, width in widths.items():
             worksheet.column_dimensions[
                 column
             ].width = width
+
         worksheet.row_dimensions[2].height = 34
 
     # -----------------------------------------------------
@@ -2236,38 +2448,172 @@ def create_blank_master_template_bytes(
         "Department Summary"
     )
     department.append(
-        ["Department", "Total Manpower"]
+        [
+            "Department",
+            "Total Manpower",
+        ]
     )
     department_rows = [
-        ["AC", "=SUM('Daily Master'!B:B)"],
-        ["EL", "=SUM('Daily Master'!C:C)"],
-        ["FS", "=SUM('Daily Master'!D:D)"],
-        ["PD", "=SUM('Daily Master'!E:E)"],
-        ["Grand Total", "=SUM(B2:B5)"],
+        [
+            "AC",
+            "=SUM('Daily Master'!B:B)",
+        ],
+        [
+            "EL",
+            "=SUM('Daily Master'!C:C)",
+        ],
+        [
+            "FS",
+            "=SUM('Daily Master'!D:D)",
+        ],
+        [
+            "PD",
+            "=SUM('Daily Master'!E:E)",
+        ],
+        [
+            "Grand Total",
+            "=SUM(B2:B5)",
+        ],
     ]
+
     for row in department_rows:
         department.append(row)
 
-    set_master_header_style(department, "A1:B1")
-    set_master_body_style(department, "A2:B6")
+    set_master_header_style(
+        department,
+        "A1:B1",
+    )
+    set_master_body_style(
+        department,
+        "A2:B6",
+    )
+
     for cell in department["B"]:
         cell.alignment = Alignment(
             horizontal="center",
             vertical="center",
         )
+
     for column in "AB":
-        department[f"{column}6"].fill = PatternFill(
+        department[
+            f"{column}6"
+        ].fill = PatternFill(
             fill_type="solid",
             fgColor=MASTER_LIGHT_BLUE_FILL,
         )
-        department[f"{column}6"].font = Font(
+        department[
+            f"{column}6"
+        ].font = Font(
             name="Times New Roman",
             size=12,
             bold=True,
             color=MASTER_DARK_BLUE_FONT,
         )
+
     department.column_dimensions["A"].width = 24
     department.column_dimensions["B"].width = 20
+
+    # -----------------------------------------------------
+    # Overview chart
+    # -----------------------------------------------------
+    chart = BarChart()
+    chart.type = "col"
+    chart.grouping = "clustered"
+    chart.style = 10
+    chart.title = "Total Manpower by Department"
+    chart.legend = None
+    chart.gapWidth = 150
+    chart.display_blanks = "zero"
+
+    # Keep the title above the plotting area instead of overlaying it.
+    chart.title.overlay = False
+
+    # Restore a proper bottom X-axis and left Y-axis.  In v0.7.3 the
+    # category axis inherited the wrong position, which could hide the
+    # department labels and make the chart look misaligned.
+    chart.x_axis.axPos = "b"
+    chart.x_axis.delete = False
+    chart.x_axis.tickLblPos = "nextTo"
+    chart.x_axis.majorTickMark = "none"
+    chart.x_axis.minorTickMark = "none"
+    chart.x_axis.crosses = "autoZero"
+    chart.x_axis.title = "Department"
+
+    chart.y_axis.axPos = "l"
+    chart.y_axis.delete = False
+    chart.y_axis.tickLblPos = "nextTo"
+    chart.y_axis.majorTickMark = "none"
+    chart.y_axis.minorTickMark = "none"
+    chart.y_axis.crosses = "autoZero"
+    chart.y_axis.crossBetween = "between"
+    chart.y_axis.title = "Manpower"
+    chart.y_axis.numFmt = "0"
+    chart.y_axis.scaling.min = 0
+
+    # Visible but restrained axis lines and horizontal gridlines.
+    chart.x_axis.spPr = GraphicalProperties(
+        ln=LineProperties(
+            solidFill="A6A6A6",
+            w=9525,
+        )
+    )
+    chart.y_axis.spPr = GraphicalProperties(
+        ln=LineProperties(
+            solidFill="A6A6A6",
+            w=9525,
+        )
+    )
+    chart.y_axis.majorGridlines.spPr = GraphicalProperties(
+        ln=LineProperties(
+            solidFill="D9D9D9",
+            prstDash="dash",
+            w=9525,
+        )
+    )
+
+    chart_data = Reference(
+        department,
+        min_col=2,
+        min_row=1,
+        max_row=5,
+    )
+    chart_categories = Reference(
+        department,
+        min_col=1,
+        min_row=2,
+        max_row=5,
+    )
+    chart.add_data(
+        chart_data,
+        titles_from_data=True,
+    )
+    chart.set_categories(
+        chart_categories
+    )
+
+    # Match the original workbook layout: full width from column A to I
+    # and enough height for the title, axes and all labels.
+    chart.anchor = TwoCellAnchor(
+        _from=AnchorMarker(
+            col=0,
+            row=14,
+        ),
+        to=AnchorMarker(
+            col=8,
+            row=32,
+        ),
+    )
+
+    # Use the same dark blue as the workbook header.
+    if chart.series:
+        chart.series[
+            0
+        ].graphicalProperties.solidFill = MASTER_HEADER_FILL
+        chart.series[
+            0
+        ].graphicalProperties.line.solidFill = MASTER_HEADER_FILL
+
+    overview.add_chart(chart)
 
     # Put the workbook in a normal calculation state.
     try:
@@ -2280,7 +2626,6 @@ def create_blank_master_template_bytes(
     output_buffer = io.BytesIO()
     workbook.save(output_buffer)
     return output_buffer.getvalue()
-
 
 
 
@@ -2678,7 +3023,42 @@ def workbook_record_sort_key(
         location,
         re.I,
     ):
-        return (report_date, 0, 999, 9999, location)
+        return (
+            report_date,
+            0,
+            998,
+            0,
+            location,
+        )
+
+    # A floor stated without a tower still belongs to the Tower section.
+    # Keep it immediately below the generic tower/floor-unspecified row
+    # instead of placing it after Podium and Basement.
+    if area.lower() == "tower (unspecified)":
+        floor_only = re.fullmatch(
+            r"(GF|\d+F)",
+            location,
+            re.I,
+        )
+        if floor_only:
+            floor = floor_only.group(1).upper()
+            floor_rank = (
+                0
+                if floor == "GF"
+                else -int(
+                    re.search(
+                        r"\d+",
+                        floor,
+                    ).group()
+                )
+            )
+            return (
+                report_date,
+                0,
+                999,
+                floor_rank,
+                location,
+            )
 
     if area.lower() == "podium":
         podium_floor = re.fullmatch(r"(GF|\d+F)", location, re.I)
@@ -3588,6 +3968,9 @@ def export_updated_workbook(
     daily_changes = update_daily_master(
         workbook["Daily Master"],
         daily_updates,
+    )
+    apply_daily_master_banding(
+        workbook["Daily Master"],
     )
 
     confirmed_location_records, confirmed_cross_records = (
