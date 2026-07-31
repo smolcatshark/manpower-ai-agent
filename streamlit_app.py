@@ -31,13 +31,14 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 
 
 st.set_page_config(
-    page_title="Manpower AI Agent",
+    page_title="Manpower Report Agent",
     page_icon="🏗️",
     layout="wide",
 )
 
 REQUIRED_TRADES = ("AC", "EL", "FS", "PD")
-APP_VERSION = "0.8.4 — Final export review"
+APP_VERSION = "0.8.6 — Author branding"
+APP_AUTHOR = "Oscar Leung"
 PARSER_MODE_OPTIONS = {
     "自動偵測": "auto",
     "Location＋Manpower數字欄": "numeric_table",
@@ -4734,13 +4735,13 @@ def render_workflow_dashboard() -> None:
 # Page title
 # =========================================================
 
-st.title("🏗️ 工地人力日報智能體（Python版）")
+st.title("🏗️ 工地人力日報智能體")
 st.write(
     "建立工程及樓層配置，上傳 AC、EL、FS 和 PD 日報。"
     "目前以純 Python 分析 AC、EL、FS 和 PD PDF，不需要任何 AI API。"
     "系統可自動偵測姓名表、Manpower數字欄、描述中的人數，或只保留總人數。"
 )
-st.caption(f"目前版本：{APP_VERSION}")
+st.caption(f"作者：{APP_AUTHOR} ｜ 目前版本：{APP_VERSION}")
 render_workflow_dashboard()
 st.divider()
 
