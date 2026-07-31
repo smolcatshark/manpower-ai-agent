@@ -12,6 +12,7 @@ import pdfplumber
 import streamlit as st
 from openpyxl import Workbook, load_workbook
 from openpyxl.chart import BarChart, Reference
+from openpyxl.chart.layout import Layout, ManualLayout
 from openpyxl.chart.shapes import GraphicalProperties
 from openpyxl.drawing.line import LineProperties
 from openpyxl.drawing.spreadsheet_drawing import (
@@ -36,7 +37,7 @@ st.set_page_config(
 )
 
 REQUIRED_TRADES = ("AC", "EL", "FS", "PD")
-APP_VERSION = "0.7.4 — Overview chart layout fix"
+APP_VERSION = "0.8.2 — Axis title centering"
 PARSER_MODE_OPTIONS = {
     "自動偵測": "auto",
     "Location＋Manpower數字欄": "numeric_table",
@@ -2538,6 +2539,19 @@ def create_blank_master_template_bytes(
     chart.x_axis.minorTickMark = "none"
     chart.x_axis.crosses = "autoZero"
     chart.x_axis.title = "Department"
+    chart.x_axis.title.overlay = False
+    chart.x_axis.title.layout = Layout(
+        manualLayout=ManualLayout(
+            xMode="factor",
+            yMode="factor",
+            wMode="factor",
+            hMode="factor",
+            x=0.416,
+            y=0.955,
+            w=0.20,
+            h=0.035,
+        )
+    )
 
     chart.y_axis.axPos = "l"
     chart.y_axis.delete = False
@@ -2547,6 +2561,19 @@ def create_blank_master_template_bytes(
     chart.y_axis.crosses = "autoZero"
     chart.y_axis.crossBetween = "between"
     chart.y_axis.title = "Manpower"
+    chart.y_axis.title.overlay = False
+    chart.y_axis.title.layout = Layout(
+        manualLayout=ManualLayout(
+            xMode="factor",
+            yMode="factor",
+            wMode="factor",
+            hMode="factor",
+            x=0.005,
+            y=0.341,
+            w=0.035,
+            h=0.30,
+        )
+    )
     chart.y_axis.numFmt = "0"
     chart.y_axis.scaling.min = 0
 
@@ -2600,7 +2627,7 @@ def create_blank_master_template_bytes(
         ),
         to=AnchorMarker(
             col=8,
-            row=32,
+            row=33,
         ),
     )
 
@@ -4445,6 +4472,273 @@ def build_validation_report(
 
 
 # =========================================================
+# Workflow dashboard
+# =========================================================
+
+
+def render_workflow_dashboard() -> None:
+    """Show the current end-to-end workflow status."""
+
+    project_ready = bool(
+        st.session_state.get("project_config")
+    )
+
+    uploaded_files = st.session_state.get(
+        "unique_uploaded_files",
+        [],
+    )
+    uploaded_trades = {
+        clean_cell(file_data.get("trade"))
+        for file_data in uploaded_files
+        if clean_cell(file_data.get("trade"))
+        in REQUIRED_TRADES
+    }
+    upload_ready = set(REQUIRED_TRADES).issubset(
+        uploaded_trades
+    )
+
+    analysis_results = st.session_state.get(
+        "analysis_results",
+        [],
+    )
+    analysis_ready = bool(analysis_results)
+
+    edited_records = st.session_state.get(
+        "edited_detail_records",
+        [],
+    )
+    unresolved_count = sum(
+        1
+        for record in edited_records
+        if clean_cell(record.get("位置狀態"))
+        not in {
+            "已解析",
+            "已人工確認保留",
+        }
+    )
+
+    blocker_count = st.session_state.get(
+        "validation_blockers_v061"
+    )
+    warning_count = st.session_state.get(
+        "validation_warnings_v061"
+    )
+
+    validation_ready = (
+        analysis_ready
+        and blocker_count == 0
+        and warning_count == 0
+    )
+    export_ready = bool(
+        st.session_state.get(
+            "excel_export_bytes_v070"
+        )
+    )
+
+    workflow_steps = [
+        {
+            "number": 1,
+            "label": "工程設定",
+            "complete": project_ready,
+            "active": not project_ready,
+            "detail": (
+                "已完成"
+                if project_ready
+                else "請先建立工程"
+            ),
+        },
+        {
+            "number": 2,
+            "label": "上傳報告",
+            "complete": upload_ready,
+            "active": (
+                project_ready
+                and not upload_ready
+            ),
+            "detail": (
+                f"{len(uploaded_trades)}/4 工種"
+            ),
+        },
+        {
+            "number": 3,
+            "label": "分析與覆核",
+            "complete": (
+                analysis_ready
+                and unresolved_count == 0
+            ),
+            "active": (
+                upload_ready
+                and (
+                    not analysis_ready
+                    or unresolved_count > 0
+                )
+            ),
+            "detail": (
+                "尚未分析"
+                if not analysis_ready
+                else (
+                    "已完成"
+                    if unresolved_count == 0
+                    else f"{unresolved_count} 列待處理"
+                )
+            ),
+        },
+        {
+            "number": 4,
+            "label": "資料核對",
+            "complete": validation_ready,
+            "active": (
+                analysis_ready
+                and not validation_ready
+            ),
+            "detail": (
+                "尚未核對"
+                if blocker_count is None
+                else (
+                    "已通過"
+                    if validation_ready
+                    else (
+                        f"{int(blocker_count or 0)} 錯誤／"
+                        f"{int(warning_count or 0)} 警告"
+                    )
+                )
+            ),
+        },
+        {
+            "number": 5,
+            "label": "匯出Excel",
+            "complete": export_ready,
+            "active": (
+                validation_ready
+                and not export_ready
+            ),
+            "detail": (
+                "檔案已建立"
+                if export_ready
+                else "尚未建立"
+            ),
+        },
+    ]
+
+    completed_steps = sum(
+        int(step["complete"])
+        for step in workflow_steps
+    )
+    progress_value = completed_steps / len(
+        workflow_steps
+    )
+
+    st.markdown(
+        """
+        <style>
+        .workflow-card {
+            border: 1px solid #D9E2F3;
+            border-radius: 10px;
+            padding: 12px 10px;
+            min-height: 105px;
+            background: #FFFFFF;
+        }
+        .workflow-card-complete {
+            border-color: #70AD47;
+            background: #F3F9EF;
+        }
+        .workflow-card-active {
+            border-color: #2F75B5;
+            background: #EAF3F8;
+        }
+        .workflow-number {
+            font-size: 0.78rem;
+            color: #5B6573;
+            margin-bottom: 4px;
+        }
+        .workflow-label {
+            font-weight: 700;
+            font-size: 1rem;
+            color: #1F4E78;
+            margin-bottom: 6px;
+        }
+        .workflow-detail {
+            font-size: 0.84rem;
+            color: #4B5563;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("### 工作流程")
+    st.progress(
+        progress_value,
+        text=(
+            f"流程完成度："
+            f"{completed_steps}/{len(workflow_steps)}"
+        ),
+    )
+
+    columns = st.columns(
+        len(workflow_steps),
+        gap="small",
+    )
+
+    for column, step in zip(
+        columns,
+        workflow_steps,
+    ):
+        if step["complete"]:
+            card_class = (
+                "workflow-card workflow-card-complete"
+            )
+            status_icon = "✅"
+        elif step["active"]:
+            card_class = (
+                "workflow-card workflow-card-active"
+            )
+            status_icon = "▶"
+        else:
+            card_class = "workflow-card"
+            status_icon = "○"
+
+        with column:
+            st.markdown(
+                (
+                    f'<div class="{card_class}">'
+                    f'<div class="workflow-number">'
+                    f'{status_icon} STEP {step["number"]}'
+                    f"</div>"
+                    f'<div class="workflow-label">'
+                    f'{step["label"]}'
+                    f"</div>"
+                    f'<div class="workflow-detail">'
+                    f'{step["detail"]}'
+                    f"</div>"
+                    f"</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+
+    summary_col1, summary_col2, summary_col3, (
+        summary_col4
+    ) = st.columns(4)
+
+    summary_col1.metric(
+        "已上傳工種",
+        f"{len(uploaded_trades)}/4",
+    )
+    summary_col2.metric(
+        "已分析報告",
+        len(analysis_results),
+    )
+    summary_col3.metric(
+        "待處理位置",
+        unresolved_count,
+    )
+    summary_col4.metric(
+        "Excel狀態",
+        "已建立" if export_ready else "未建立",
+    )
+
+
+# =========================================================
 # Page title
 # =========================================================
 
@@ -4454,6 +4748,8 @@ st.write(
     "目前以純 Python 分析 AC、EL、FS 和 PD PDF，不需要任何 AI API。"
     "系統可自動偵測姓名表、Manpower數字欄、描述中的人數，或只保留總人數。"
 )
+st.caption(f"目前版本：{APP_VERSION}")
+render_workflow_dashboard()
 st.divider()
 
 
@@ -4783,8 +5079,6 @@ else:
 
 st.divider()
 st.subheader("5. AC／EL／FS／PD 彈性 Python 分析")
-st.caption(f"目前版本：{APP_VERSION}")
-
 unique_uploaded_files = st.session_state.get("unique_uploaded_files", [])
 supported_pdf_files = [
     file_data
