@@ -37,7 +37,7 @@ st.set_page_config(
 )
 
 REQUIRED_TRADES = ("AC", "EL", "FS", "PD")
-APP_VERSION = "0.8.2 — Axis title centering"
+APP_VERSION = "0.8.4 — Final export review"
 PARSER_MODE_OPTIONS = {
     "自動偵測": "auto",
     "Location＋Manpower數字欄": "numeric_table",
@@ -2529,6 +2529,22 @@ def create_blank_master_template_bytes(
     # Keep the title above the plotting area instead of overlaying it.
     chart.title.overlay = False
 
+    # Define only the plot-area margins. Axis-title coordinates are left
+    # automatic so Excel centres "Department" under AC–PD and centres
+    # "Manpower" against the full Y-axis tick-value range.
+    chart.layout = Layout(
+        manualLayout=ManualLayout(
+            xMode="factor",
+            yMode="factor",
+            wMode="factor",
+            hMode="factor",
+            x=0.085,
+            y=0.12,
+            w=0.89,
+            h=0.76,
+        )
+    )
+
     # Restore a proper bottom X-axis and left Y-axis.  In v0.7.3 the
     # category axis inherited the wrong position, which could hide the
     # department labels and make the chart look misaligned.
@@ -2540,18 +2556,6 @@ def create_blank_master_template_bytes(
     chart.x_axis.crosses = "autoZero"
     chart.x_axis.title = "Department"
     chart.x_axis.title.overlay = False
-    chart.x_axis.title.layout = Layout(
-        manualLayout=ManualLayout(
-            xMode="factor",
-            yMode="factor",
-            wMode="factor",
-            hMode="factor",
-            x=0.416,
-            y=0.955,
-            w=0.20,
-            h=0.035,
-        )
-    )
 
     chart.y_axis.axPos = "l"
     chart.y_axis.delete = False
@@ -2562,18 +2566,6 @@ def create_blank_master_template_bytes(
     chart.y_axis.crossBetween = "between"
     chart.y_axis.title = "Manpower"
     chart.y_axis.title.overlay = False
-    chart.y_axis.title.layout = Layout(
-        manualLayout=ManualLayout(
-            xMode="factor",
-            yMode="factor",
-            wMode="factor",
-            hMode="factor",
-            x=0.005,
-            y=0.341,
-            w=0.035,
-            h=0.30,
-        )
-    )
     chart.y_axis.numFmt = "0"
     chart.y_axis.scaling.min = 0
 
@@ -5183,6 +5175,10 @@ else:
             "excel_export_preview_v070",
             None,
         )
+        st.session_state.pop(
+            "final_export_confirmation_v084",
+            None,
+        )
         st.success("AC／EL／FS／PD PDF 分析完成。")
 
 
@@ -5841,6 +5837,231 @@ else:
     else:
         st.success("資料核對已通過，可以建立Excel。")
 
+    # =====================================================
+    # Final export review
+    # =====================================================
+
+    st.markdown("### 最終匯出檢查")
+    st.caption(
+        "建立Excel前，先確認本次報告日期、"
+        "四工種總人數及位置分配情況。"
+    )
+
+    valid_report_dates = sorted(
+        {
+            clean_cell(summary.get("日期"))
+            for summary in summary_rows
+            if clean_cell(summary.get("日期"))
+            not in {"", "未讀取"}
+        }
+    )
+
+    trade_review_rows: list[dict[str, Any]] = []
+    total_worker_count = 0
+
+    for trade in REQUIRED_TRADES:
+        matching_summaries = [
+            summary
+            for summary in summary_rows
+            if clean_cell(
+                summary.get("工種")
+            ).upper()
+            == trade
+        ]
+
+        trade_worker_total = sum(
+            to_non_negative_int(
+                summary.get("Worker")
+            )
+            or 0
+            for summary in matching_summaries
+        )
+        trade_daily_total = sum(
+            (
+                to_non_negative_int(
+                    summary.get(
+                        "Today Total Manpower"
+                    )
+                )
+                if to_non_negative_int(
+                    summary.get(
+                        "Today Total Manpower"
+                    )
+                )
+                is not None
+                else (
+                    to_non_negative_int(
+                        summary.get("Worker")
+                    )
+                    or 0
+                )
+            )
+            for summary in matching_summaries
+        )
+
+        total_worker_count += trade_worker_total
+
+        trade_review_rows.append(
+            {
+                "工種": trade,
+                "報告數量": len(
+                    matching_summaries
+                ),
+                "Worker": trade_worker_total,
+                "Today Total Manpower": (
+                    trade_daily_total
+                ),
+                "核對狀態": (
+                    "通過"
+                    if matching_summaries
+                    and all(
+                        clean_cell(
+                            summary.get(
+                                "Worker核對"
+                            )
+                        )
+                        == "一致"
+                        for summary in (
+                            matching_summaries
+                        )
+                    )
+                    else "需檢查"
+                ),
+            }
+        )
+
+    confirmed_location_total = sum(
+        to_non_negative_int(
+            record.get("合計")
+        )
+        or 0
+        for record in confirmed_export_records
+    )
+    review_location_total = sum(
+        to_non_negative_int(
+            record.get("合計")
+        )
+        or 0
+        for record in review_export_records
+    )
+    allocated_location_total = (
+        confirmed_location_total
+        + review_location_total
+    )
+
+    date_display = (
+        valid_report_dates[0]
+        if len(valid_report_dates) == 1
+        else (
+            f"{valid_report_dates[0]} 至 "
+            f"{valid_report_dates[-1]}"
+            if valid_report_dates
+            else "未讀取"
+        )
+    )
+
+    final_metric1, final_metric2, (
+        final_metric3
+    ), final_metric4 = st.columns(4)
+
+    final_metric1.metric(
+        "報告日期",
+        date_display,
+    )
+    final_metric2.metric(
+        "Worker總人數",
+        total_worker_count,
+    )
+    final_metric3.metric(
+        "單一／確定位置",
+        confirmed_location_total,
+    )
+    final_metric4.metric(
+        "Cross-F／未指定",
+        review_location_total,
+    )
+
+    st.dataframe(
+        pd.DataFrame(trade_review_rows),
+        width="stretch",
+        hide_index=True,
+    )
+
+    if (
+        total_worker_count
+        == allocated_location_total
+    ):
+        st.success(
+            "位置明細合計與四工種Worker總人數一致："
+            f"{allocated_location_total}人。"
+        )
+    else:
+        st.error(
+            "位置明細合計與Worker總人數不一致："
+            f"Worker {total_worker_count}人，"
+            f"位置明細 {allocated_location_total}人。"
+        )
+
+    final_check_rows = [
+        {
+            "檢查項目": "AC／EL／FS／PD報告",
+            "狀態": (
+                "✅ 四工種齊全"
+                if all(
+                    row["報告數量"] >= 1
+                    for row in trade_review_rows
+                )
+                else "❌ 報告不完整"
+            ),
+        },
+        {
+            "檢查項目": "阻止匯出的資料錯誤",
+            "狀態": (
+                "✅ 沒有"
+                if audit_blocker_count == 0
+                else (
+                    f"❌ {audit_blocker_count}項"
+                )
+            ),
+        },
+        {
+            "檢查項目": "尚未完成位置覆核",
+            "狀態": (
+                "✅ 沒有"
+                if audit_warning_count == 0
+                else (
+                    f"⚠️ {audit_warning_count}項"
+                )
+            ),
+        },
+        {
+            "檢查項目": "Worker與位置明細",
+            "狀態": (
+                "✅ 一致"
+                if (
+                    total_worker_count
+                    == allocated_location_total
+                )
+                else "❌ 不一致"
+            ),
+        },
+    ]
+
+    st.dataframe(
+        pd.DataFrame(final_check_rows),
+        width="stretch",
+        hide_index=True,
+    )
+
+    export_confirmation = st.checkbox(
+        (
+            "我已確認本次日期、四工種人數及"
+            "Cross-F／未指定位置，並準備建立Excel。"
+        ),
+        key="final_export_confirmation_v084",
+        disabled=(audit_blocker_count > 0),
+    )
+
     export_mode = st.radio(
         "選擇Excel輸出模式",
         options=[
@@ -5935,12 +6156,25 @@ else:
         else "建立全新工程Excel預覽"
     )
 
+    if (
+        template_bytes_for_export is not None
+        and not export_confirmation
+        and audit_blocker_count == 0
+    ):
+        st.info(
+            "完成上方最終確認後，"
+            "便可建立Excel預覽。"
+        )
+
     if template_bytes_for_export is not None:
         if st.button(
             preview_button_text,
             type="primary",
             width="stretch",
-            disabled=(audit_blocker_count > 0),
+            disabled=(
+                audit_blocker_count > 0
+                or not export_confirmation
+            ),
         ):
             try:
                 export_bytes, export_preview = (
