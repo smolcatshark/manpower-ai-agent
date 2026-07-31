@@ -37,19 +37,10 @@ jobs:
           --clean
           Manpower_Report_Agent.spec
 
-      - name: Create distributable ZIP
-        shell: pwsh
-        run: |
-          Compress-Archive `
-            -Path "dist\Manpower Report Agent\*" `
-            -DestinationPath `
-              "dist\Manpower-Report-Agent-Windows.zip" `
-            -Force
-
       - name: Upload Windows application
         uses: actions/upload-artifact@v4
         with:
           name: Manpower-Report-Agent-Windows
-          path: dist/Manpower-Report-Agent-Windows.zip
+          path: dist/Manpower Report Agent/
           if-no-files-found: error
           retention-days: 30

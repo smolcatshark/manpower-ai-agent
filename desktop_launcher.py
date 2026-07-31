@@ -136,6 +136,9 @@ def run_streamlit_child() -> None:
             f"Bundled application file not found: {app_path}"
         )
 
+    os.environ["STREAMLIT_GLOBAL_DEVELOPMENT_MODE"] = (
+        "false"
+    )
     os.environ.setdefault(
         "STREAMLIT_BROWSER_GATHER_USAGE_STATS",
         "false",
@@ -155,6 +158,7 @@ def run_streamlit_child() -> None:
         str(app_path),
         f"--server.address={HOST}",
         f"--server.port={port}",
+        "--global.developmentMode=false",
         "--server.headless=true",
         "--server.fileWatcherType=none",
         "--server.runOnSave=false",

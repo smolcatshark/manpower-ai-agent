@@ -55,3 +55,12 @@ and starts faster for a Streamlit application with pandas, pdfplumber,
 and openpyxl. The folder can later be wrapped in a normal Windows
 installer with a desktop shortcut, so end users only interact with one
 shortcut and the app window.
+
+
+## Phase 7.1.1 startup fix
+
+The launcher explicitly disables Streamlit development mode before
+setting the dynamically selected local server port.
+
+The GitHub workflow now uploads the built application folder directly,
+avoiding the previous same-named inner ZIP file.
