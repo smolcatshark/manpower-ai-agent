@@ -295,32 +295,97 @@ def stop_process(
         process.wait(timeout=5)
 
 
+def open_browser_fallback(url: str) -> None:
+    """Run the app in the default browser when pywebview is unavailable."""
+    import tkinter as tk
+    import webbrowser
+    from tkinter import ttk
+
+    logging.warning("Using browser compatibility mode.")
+    webbrowser.open(url, new=1, autoraise=True)
+
+    root = tk.Tk()
+    root.title(f"{APP_TITLE} — Compatibility Mode")
+    root.geometry("520x255")
+    root.minsize(460, 225)
+
+    frame = ttk.Frame(root, padding=(28, 24))
+    frame.pack(fill="both", expand=True)
+
+    ttk.Label(
+        frame,
+        text=APP_TITLE,
+        font=("Segoe UI", 16, "bold"),
+    ).pack(anchor="w", pady=(0, 12))
+
+    ttk.Label(
+        frame,
+        text=(
+            "The application is running in your default browser.\n"
+            "Keep this window open while using the app.\n"
+            "Close this window when you have finished."
+        ),
+        justify="left",
+        wraplength=450,
+    ).pack(anchor="w", pady=(0, 20))
+
+    buttons = ttk.Frame(frame)
+    buttons.pack(fill="x", side="bottom")
+
+    ttk.Button(
+        buttons,
+        text="Open App Again",
+        command=lambda: webbrowser.open(
+            url,
+            new=1,
+            autoraise=True,
+        ),
+    ).pack(side="left")
+
+    ttk.Button(
+        buttons,
+        text="Close Application",
+        command=root.destroy,
+    ).pack(side="right")
+
+    root.protocol("WM_DELETE_WINDOW", root.destroy)
+    root.mainloop()
+
+
 def open_desktop_window(url: str) -> None:
-    """Open the Streamlit interface inside a native desktop window."""
-    import webview
+    """Open a native window, then fall back to a browser if required."""
+    try:
+        import webview
 
-    webview.settings["ALLOW_DOWNLOADS"] = True
-    webview.settings[
-        "OPEN_EXTERNAL_LINKS_IN_BROWSER"
-    ] = True
+        webview.settings["ALLOW_DOWNLOADS"] = True
+        webview.settings[
+            "OPEN_EXTERNAL_LINKS_IN_BROWSER"
+        ] = True
 
-    webview.create_window(
-        APP_TITLE,
-        url,
-        width=1440,
-        height=920,
-        min_size=(1024, 700),
-        resizable=True,
-        confirm_close=False,
-        background_color="#FFFFFF",
-        text_select=True,
-        zoomable=True,
-    )
+        webview.create_window(
+            APP_TITLE,
+            url,
+            width=1440,
+            height=920,
+            min_size=(1024, 700),
+            resizable=True,
+            confirm_close=False,
+            background_color="#FFFFFF",
+            text_select=True,
+            zoomable=True,
+        )
 
-    webview.start(
-        debug=False,
-        private_mode=True,
-    )
+        webview.start(
+            debug=False,
+            private_mode=True,
+        )
+
+    except Exception:
+        logging.exception(
+            "The native pywebview window failed. "
+            "Switching to browser compatibility mode."
+        )
+        open_browser_fallback(url)
 
 
 def run_desktop_application() -> int:
